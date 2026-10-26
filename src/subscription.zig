@@ -12,6 +12,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const AtomicU64 = @import("atomic_u64.zig").AtomicU64;
 const xsync = @import("xsync");
 const Io = std.Io;
 const io_util = @import("io_util.zig");
@@ -58,14 +59,14 @@ pub const Subscription = struct {
 
     // Track pending messages and bytes for both sync and async subscriptions
     pending_msgs: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    pending_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    pending_bytes: AtomicU64 = AtomicU64.init(0),
 
     // Slow-consumer protection: when either pending limit is exceeded,
     // incoming messages for this subscription are dropped and counted
     // (0 = unlimited). Defaults match nats.go.
     pending_msgs_limit: std.atomic.Value(u32) = std.atomic.Value(u32).init(default_pending_msgs_limit),
-    pending_bytes_limit: std.atomic.Value(u64) = std.atomic.Value(u64).init(default_pending_bytes_limit),
-    dropped_msgs: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    pending_bytes_limit: AtomicU64 = AtomicU64.init(default_pending_bytes_limit),
+    dropped_msgs: AtomicU64 = AtomicU64.init(0),
     slow_consumer: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     // Armed when a synchronous subscription enters a slow-consumer episode;
     // consumed by the next synchronous receive. Multiple episodes before a
@@ -73,8 +74,8 @@ pub const Subscription = struct {
     sc_error_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     // Autounsubscribe state
-    max_msgs: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // 0 means no limit
-    delivered_msgs: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    max_msgs: AtomicU64 = AtomicU64.init(0), // 0 means no limit
+    delivered_msgs: AtomicU64 = AtomicU64.init(0),
 
     // Drain state
     draining: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),

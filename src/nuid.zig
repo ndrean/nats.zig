@@ -111,7 +111,7 @@ fn encodeBase36(value: u64, buffer: []u8) void {
     // Fill buffer from right to left
     while (i > 0) {
         i -= 1;
-        buffer[i] = DIGITS[val % BASE];
+        buffer[i] = DIGITS[@intCast(val % BASE)];
         val /= BASE;
     }
 }

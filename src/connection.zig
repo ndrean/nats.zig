@@ -12,6 +12,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const AtomicU64 = @import("atomic_u64.zig").AtomicU64;
 const net = std.Io.net;
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
@@ -535,7 +536,7 @@ pub const Connection = struct {
     write_buffer: WriteBuffer,
 
     // Subscriptions
-    next_sid: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
+    next_sid: AtomicU64 = AtomicU64.init(1),
     subscriptions: std.AutoHashMap(u64, *Subscription),
     // Guards `subscriptions`. Acquired after `mutex` when both are held; see
     // the lock-order note on `mutex`.

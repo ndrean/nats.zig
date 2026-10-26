@@ -263,7 +263,7 @@ pub const KVWatcher = struct {
                 self.received += 1;
                 // Set init_pending from first message if not set
                 if (self.init_pending == 0) {
-                    self.init_pending = delta;
+                    self.init_pending = @intCast(delta); // usize on 32-bit targets; a pending count fits
                 }
                 // Check completion: received > initPending OR delta == 0 (match C logic)
                 if (self.received > self.init_pending or delta == 0) {

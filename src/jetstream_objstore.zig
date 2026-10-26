@@ -613,7 +613,8 @@ pub const ObjectStore = struct {
         const arena_allocator = arena.allocator();
 
         // Allocate buffer for complete object based on size from info
-        const data = try arena_allocator.alloc(u8, result.info.size);
+        // usize on 32-bit targets: an object larger than the address space cannot be held whole.
+        const data = try arena_allocator.alloc(u8, std.math.cast(usize, result.info.size) orelse return error.OutOfMemory);
 
         // Read all data from the streaming result
         var total_read: usize = 0;

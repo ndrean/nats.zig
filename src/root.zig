@@ -97,6 +97,7 @@ pub const creds = @import("creds.zig");
 test {
     std.testing.refAllDecls(@This());
     _ = @import("net_util.zig");
+    _ = @import("atomic_u64.zig");
     // The TLS tests run a real tls.zig server, which the stub module does
     // not provide; with TLS compiled out the whole file is skipped.
     if (@import("build_options").use_tls) {
