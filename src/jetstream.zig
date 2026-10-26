@@ -1824,7 +1824,7 @@ pub const JetStream = struct {
         // Prepare consumer config, generating deliver_subject if needed
         var config = options.config orelse ConsumerConfig{};
         const generated_deliver_subject = if (config.deliver_subject == null)
-            try inbox.newInbox(self.nc.allocator)
+            try self.nc.newInbox(self.nc.allocator)
         else
             null;
         errdefer if (generated_deliver_subject) |ds| self.nc.allocator.free(ds);
@@ -1891,7 +1891,7 @@ pub const JetStream = struct {
 
         // Generate deliver_subject if not provided in the config
         const generated_deliver_subject = if (config.deliver_subject == null)
-            try inbox.newInbox(self.nc.allocator)
+            try self.nc.newInbox(self.nc.allocator)
         else
             null;
         errdefer if (generated_deliver_subject) |ds| self.nc.allocator.free(ds);
@@ -1948,7 +1948,7 @@ pub const JetStream = struct {
 
         // Generate deliver_subject if not provided in the config
         const generated_deliver_subject = if (config.deliver_subject == null)
-            try inbox.newInbox(self.nc.allocator)
+            try self.nc.newInbox(self.nc.allocator)
         else
             null;
         errdefer if (generated_deliver_subject) |ds| self.nc.allocator.free(ds);
@@ -2011,7 +2011,7 @@ pub const JetStream = struct {
 
         // Generate deliver_subject if not provided in the config
         const generated_deliver_subject = if (config.deliver_subject == null)
-            try inbox.newInbox(self.nc.allocator)
+            try self.nc.newInbox(self.nc.allocator)
         else
             null;
         errdefer if (generated_deliver_subject) |ds| self.nc.allocator.free(ds);
@@ -2051,7 +2051,7 @@ pub const JetStream = struct {
     /// Create a pull subscription for the specified stream
     /// One inbox for several pull consumers — see `PullInbox`.
     pub fn pullInbox(self: JetStream) !*PullInbox {
-        const inbox_base = try inbox.newInbox(self.nc.allocator);
+        const inbox_base = try self.nc.newInbox(self.nc.allocator);
         defer self.nc.allocator.free(inbox_base);
         const inbox_prefix = try std.fmt.allocPrint(self.nc.allocator, "{s}.", .{inbox_base});
         errdefer self.nc.allocator.free(inbox_prefix);
@@ -2094,7 +2094,7 @@ pub const JetStream = struct {
         }
 
         // Generate unique inbox prefix for this pull subscription
-        const inbox_base = try inbox.newInbox(self.nc.allocator);
+        const inbox_base = try self.nc.newInbox(self.nc.allocator);
         defer self.nc.allocator.free(inbox_base);
 
         const inbox_prefix = try std.fmt.allocPrint(self.nc.allocator, "{s}.", .{inbox_base});

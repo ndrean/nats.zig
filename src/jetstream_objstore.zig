@@ -572,7 +572,7 @@ pub const ObjectStore = struct {
         const chunk_subject = try self.getChunkSubject(obj_info.nuid);
         defer self.allocator.free(chunk_subject);
 
-        const inbox = try newInbox(self.allocator);
+        const inbox = try self.js.nc.newInbox(self.allocator);
         defer self.allocator.free(inbox);
 
         const consumer_config = ConsumerConfig{
@@ -735,7 +735,7 @@ pub const ObjectStore = struct {
         const meta_filter = try std.fmt.allocPrint(self.allocator, "{s}>", .{self.meta_subject_prefix});
         defer self.allocator.free(meta_filter);
 
-        const inbox = try newInbox(self.allocator);
+        const inbox = try self.js.nc.newInbox(self.allocator);
         defer self.allocator.free(inbox);
 
         const consumer_config = ConsumerConfig{

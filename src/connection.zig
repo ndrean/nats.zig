@@ -427,6 +427,20 @@ pub const ConnectionOptions = struct {
     /// a configured seed takes precedence.
     nkey_sign_cb: ?*const fn (nonce: []const u8) anyerror![64]u8 = null,
 
+    /// Prefix for the inboxes this client generates — the reply subject of a
+    /// request, and the delivery subject of a KV watcher, an object-store read
+    /// or a pull consumer. Without its trailing dot; the dot is added.
+    ///
+    /// The default is every NATS client's `_INBOX`, and every client on an
+    /// account then listens under one shared prefix, so a permission narrow
+    /// enough to isolate replies cannot be written. A deployment that grants
+    /// `_INBOX.<principal>.>` per principal sets this to `_INBOX.<principal>`
+    /// and its replies stay inside that grant. Same option as nats.go's
+    /// `CustomInboxPrefix`, nats.js's `inboxPrefix` and nats-py's
+    /// `inbox_prefix`. Validated at connect: non-empty, no wildcard, no
+    /// whitespace, no trailing dot, at most `inbox.max_prefix_len` bytes.
+    inbox_prefix: []const u8 = inbox.default_prefix,
+
     /// TLS configuration. When set, every connection is upgraded to TLS
     /// after the plaintext INFO (or before it, with `handshake_first`).
     /// A `tls://` server URL enables TLS with default options even when
@@ -555,7 +569,7 @@ pub const Connection = struct {
             .pending_buffer = WriteBuffer.init(allocator, io, .{ .max_size = options.reconnect.reconnect_buf_size }),
             .write_buffer = WriteBuffer.init(allocator, io, .{ .max_size = options.write_buffer_limit, .soft_limit = true }),
             .subscriptions = std.AutoHashMap(u64, *Subscription).init(allocator),
-            .response_manager = ResponseManager.init(allocator, io),
+            .response_manager = ResponseManager.init(allocator, io, options.inbox_prefix),
             .parser = Parser.init(allocator, io),
             .scratch = std.heap.ArenaAllocator.init(allocator),
             .ping_time = io_util.now(io),
@@ -660,6 +674,10 @@ pub const Connection = struct {
         errdefer if (manager_started) self.manager_task.cancel(self.io);
 
         try io_util.ensureAwakeClock(self.io);
+
+        // An inbox prefix that is not a usable subject would otherwise surface
+        // as a silent permissions violation on the first reply.
+        try inbox.validatePrefix(self.options.inbox_prefix);
 
         // Fail fast at the API boundary when TLS is requested but was
         // compiled out; tls:// URLs are additionally checked per attempt
@@ -1321,6 +1339,14 @@ pub const Connection = struct {
             .arena = undefined,
         };
         return self.requestMsg(&msg, timeout);
+    }
+
+    /// A fresh inbox subject under this connection's prefix:
+    /// `<inbox_prefix>.<22-char-nuid>`. Every inbox this library generates goes
+    /// through here, so a narrowed prefix covers replies, KV watchers,
+    /// object-store reads and pull consumers alike. The caller owns the result.
+    pub fn newInbox(self: *Self, allocator: Allocator) ![]u8 {
+        return inbox.newInboxWithPrefix(allocator, self.options.inbox_prefix);
     }
 
     pub fn requestMsg(self: *Self, msg: *Message, timeout: Io.Timeout) !*Message {

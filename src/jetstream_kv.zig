@@ -202,7 +202,7 @@ pub const KVWatcher = struct {
     pub fn init(kv: *KV, subjects: []const []const u8, options: WatchOptions) !Self {
         const allocator = kv.js.nc.allocator;
 
-        const inbox = try newInbox(allocator);
+        const inbox = try kv.js.nc.newInbox(allocator);
         defer allocator.free(inbox);
 
         const consumer_config = ConsumerConfig{
