@@ -844,6 +844,15 @@ pub const KVManager = struct {
         return try KV.init(self.js, bucket_name);
     }
 
+    /// Open a KV bucket WITHOUT asking the server about its stream — nats.js's
+    /// `Kvm.open` (bindOnly). A missing bucket is found at the first read instead.
+    /// What a key-scoped credential needs: `STREAM.INFO` takes a `subjects_filter` in
+    /// its body that no subject grant can scope, so granting it for `openBucket` lets
+    /// the holder list every key of the bucket (ZeBridge NOTES §10jr).
+    pub fn bindBucket(self: KVManager, bucket_name: []const u8) !KV {
+        return try KV.init(self.js, bucket_name);
+    }
+
     /// Delete a KV bucket
     pub fn deleteBucket(self: KVManager, bucket_name: []const u8) !void {
         try validation.validateKVBucketName(bucket_name);

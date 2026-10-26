@@ -2431,6 +2431,13 @@ pub const JetStream = struct {
         return try manager.openBucket(bucket_name);
     }
 
+    /// `kvBucket` without the stream lookup (`KVManager.bindBucket`): for a credential
+    /// granted exact keys only.
+    pub fn kvBind(self: JetStream, bucket_name: []const u8) !@import("jetstream_kv.zig").KV {
+        var manager = self.kvManager();
+        return try manager.bindBucket(bucket_name);
+    }
+
     /// Create an object store manager
     pub fn objectStoreManager(self: JetStream) @import("jetstream_objstore.zig").ObjectStoreManager {
         const jetstream_objstore = @import("jetstream_objstore.zig");
