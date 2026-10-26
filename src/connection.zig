@@ -481,7 +481,9 @@ pub const Connection = struct {
     /// completes, before the reconnected callback. The server forgets whatever a client
     /// had parked on it (a pull request waiting for messages, see `PullRequest.epoch`),
     /// so state that lives on the server side can tell it is gone by this counter.
-    reconnect_epoch: std.atomic.Value(u64) = .init(0),
+    /// u32, not u64: a 32-bit target (Android armv7) has no 64-bit atomics, and the
+    /// epoch is only ever compared for equality.
+    reconnect_epoch: std.atomic.Value(u32) = .init(0),
 
     // Exit signal of the current runConnection iteration (protected by mutex)
     exit_signal: ?*ExitSignal = null,

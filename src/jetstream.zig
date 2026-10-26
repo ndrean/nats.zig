@@ -478,7 +478,7 @@ const PullRequest = struct {
     order: u64 = 0,
     /// `Connection.reconnect_epoch` when the request was sent: a reconnect since means
     /// the server dropped it, whatever its deadline says (see `slotOpen`).
-    epoch: u64 = 0,
+    epoch: u32 = 0,
 };
 
 pub const PullSubscription = struct {
