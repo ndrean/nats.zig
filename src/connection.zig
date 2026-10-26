@@ -337,6 +337,18 @@ const TlsRuntime = struct {
     }
 };
 
+/// Which cipher suites the ClientHello offers, and with them which TLS
+/// versions the handshake can land on.
+///
+///   * `.default` — TLS 1.3 and 1.2, the 1.3 suites first, including 1.2's
+///     older CBC suites. What tls.zig offers when nothing is said.
+///   * `.secure` — TLS 1.3 and 1.2, recommended suites only: the CBC suites
+///     are not offered.
+///   * `.tls13` — TLS 1.3 only. The handshake is one round trip, there is no
+///     1.2 fallback to negotiate, and a downgrade cannot be offered at all.
+///     Refuse rather than fall back when the server has no 1.3.
+pub const CipherSuites = enum { default, secure, tls13 };
+
 pub const TlsOptions = struct {
     /// Path to a PEM CA bundle used to verify the server certificate,
     /// resolved against the current working directory. When null, the
@@ -364,6 +376,10 @@ pub const TlsOptions = struct {
     /// for servers running in handshake-first mode or behind
     /// TLS-terminating proxies.
     handshake_first: bool = false,
+    /// Which cipher suites to offer, and so which TLS versions can be
+    /// negotiated. The default offers TLS 1.3 and 1.2; `.tls13` offers
+    /// 1.3 alone.
+    cipher_suites: CipherSuites = .default,
 };
 
 pub const ConnectionOptions = struct {
@@ -2001,6 +2017,11 @@ pub const Connection = struct {
         var hs = tls.nonblock.Client.init(.{
             .host = rt.host,
             .root_ca = bundle,
+            .cipher_suites = switch (rt.opts.cipher_suites) {
+                .default => tls.config.cipher_suites.all,
+                .secure => tls.config.cipher_suites.secure,
+                .tls13 => tls.config.cipher_suites.tls13,
+            },
             .insecure_skip_verify = rt.opts.insecure_skip_verify,
             .auth = if (client_auth) |*auth| auth else null,
             .rng = rt.rng.interface(),
