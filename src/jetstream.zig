@@ -476,6 +476,9 @@ const PullRequest = struct {
     left: usize = 0,
     deadline: Io.Timeout = .none,
     order: u64 = 0,
+    /// `Connection.reconnect_epoch` when the request was sent: a reconnect since means
+    /// the server dropped it, whatever its deadline says (see `slotOpen`).
+    epoch: u64 = 0,
 };
 
 pub const PullSubscription = struct {
@@ -573,6 +576,13 @@ pub const PullSubscription = struct {
     /// A request still owes messages and has not expired (an expired one is forgotten).
     fn slotOpen(self: *PullSubscription, r: *PullRequest) bool {
         if (r.reply_len == 0 or r.left == 0) return false;
+        // Sent before a reconnect: the server forgot it, so it will never deliver or
+        // expire. Holding the slot would leave the consumer without a request until the
+        // deadline — with a long `PullInbox.request_expires_ms`, live changes would wait.
+        if (r.epoch != self.js.nc.reconnect_epoch.load(.acquire)) {
+            r.reply_len = 0;
+            return false;
+        }
         const d = r.deadline.toDurationFromNow(self.js.nc.io) orelse {
             r.reply_len = 0;
             return false;
@@ -601,6 +611,7 @@ pub const PullSubscription = struct {
             r.reply_len = n;
             r.left = batch;
             r.deadline = deadline;
+            r.epoch = self.js.nc.reconnect_epoch.load(.acquire);
             self.req_order += 1;
             r.order = self.req_order;
             return;
@@ -910,6 +921,15 @@ pub const PullInbox = struct {
     mutex: xsync.Mutex = .init,
     /// As `PullSubscription.max_bytes`, for every consumer's request on this inbox.
     max_bytes: ?u64 = null,
+    /// How long the server keeps each pull request waiting for messages, independent of
+    /// how long one `fetch` waits locally (null: the fetch's own timeout, as before). A
+    /// caller that fetches often with a short timeout otherwise sends a new request per
+    /// consumer each time, whether or not anything arrived: ZeBridge clients polling every
+    /// 250 ms sent ~6.5 pull requests a second per idle stream, about 13 a second per
+    /// connected device. With a long expiry the request stays parked, delivers each
+    /// message as it is stored, and the next fetch finds it in the inbox; a new request
+    /// goes out only when one is filled or expires (`wantsRequest`), or after a reconnect.
+    request_expires_ms: ?u32 = null,
 
     pub fn deinit(self: *PullInbox) void {
         self.inbox_subscription.deinit();
@@ -938,7 +958,13 @@ pub const PullInbox = struct {
         // `<prefix><fetch>x<i>y<k>` — one token, as the wildcard requires — so a status
         // frame names the request (and so the consumer) it answers.
         const cap = batch * subs.len;
-        const timeout_duration = timeout.toDurationFromNow(self.js.nc.io);
+        // The request's own lifetime on the server: the inbox's `request_expires_ms`, else
+        // this fetch's timeout.
+        const request_timeout: Io.Timeout = if (self.request_expires_ms) |ms|
+            .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } }
+        else
+            timeout;
+        const request_duration = request_timeout.toDurationFromNow(self.js.nc.io);
         for (subs, 0..) |sub, i| {
             if (sub.inbox_subscription != self.inbox_subscription) return error.NotOnThisInbox;
             var k: usize = 0;
@@ -948,13 +974,13 @@ pub const PullInbox = struct {
                 const request_json = try jsonStringifyAlloc(a, FetchRequest{
                     .batch = batch,
                     .max_bytes = self.max_bytes,
-                    .expires = if (timeout_duration) |d| @intCast(d.raw.toNanoseconds()) else null,
+                    .expires = if (request_duration) |d| @intCast(d.raw.toNanoseconds()) else null,
                 }, .{ .emit_null_optional_fields = false });
                 defer a.free(request_json);
                 const api_subject = try sub.nextSubject(a);
                 defer a.free(api_subject);
                 try self.js.nc.publishRequest(api_subject, new_reply, request_json);
-                sub.requestStart(new_reply, batch, timeout.toDeadline(self.js.nc.io));
+                sub.requestStart(new_reply, batch, request_timeout.toDeadline(self.js.nc.io));
             }
         }
 

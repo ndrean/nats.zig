@@ -307,3 +307,43 @@ test "JetStream shared pull inbox: one wait over two streams, partial failure pe
     try js.deleteConsumer("TEST_INBOX_B", "inbox_b");
     try testing.expectError(error.NoResponders, shared.fetch(&subs, 1, .{ .duration = .{ .raw = .fromMilliseconds(300), .clock = .awake } }));
 }
+
+test "JetStream shared pull inbox: a long request expiry parks one request, and it still delivers" {
+    const io = std.testing.io;
+    const nc = try utils.createDefaultConnection(io);
+    defer utils.closeConnection(nc);
+    var js = nc.jetstream(.{});
+
+    var info = try js.addStream(.{ .name = "TEST_INBOX_LONG", .subjects = &[_][]const u8{"test.inbox.long.*"}, .storage = .memory, .max_msgs = 10 });
+    defer info.deinit();
+    defer js.deleteStream("TEST_INBOX_LONG") catch {};
+
+    const shared = try js.pullInbox();
+    defer shared.deinit();
+    // The server keeps each pull request 10 s; every fetch below waits 100 ms.
+    shared.request_expires_ms = 10_000;
+    var sub = try js.pullSubscribe("test.inbox.long.*", "inbox_long", .{ .stream = "TEST_INBOX_LONG", .inbox = shared });
+    defer sub.deinit();
+    const subs = [_]*PullSubscription{sub};
+    const short: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } };
+
+    // An idle stream polled ten times: one request parked, not ten.
+    for (0..10) |_| {
+        var mb = try shared.fetch(&subs, 100, short);
+        defer mb.deinit();
+        try testing.expectEqual(0, mb.messages.len);
+    }
+    var ci = try js.getConsumerInfo("TEST_INBOX_LONG", "inbox_long");
+    defer ci.deinit();
+    std.debug.print("shared inbox, 10 s request expiry: after ten 100 ms fetches on an idle stream, {d} request(s) waiting\n", .{ci.value.num_waiting});
+    try testing.expectEqual(@as(u64, 1), ci.value.num_waiting);
+
+    // A message stored now is delivered through the parked request: the next fetch has it.
+    try nc.publish("test.inbox.long.one", "late");
+    try nc.flush();
+    var mb = try shared.fetch(&subs, 100, .{ .duration = .{ .raw = .fromMilliseconds(500), .clock = .awake } });
+    defer mb.deinit();
+    try testing.expectEqual(1, mb.messages.len);
+    try testing.expectEqualStrings("late", mb.messages[0].msg.data);
+    try mb.messages[0].ack();
+}

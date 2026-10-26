@@ -477,6 +477,11 @@ pub const Connection = struct {
     /// connect() cannot miss a short-lived `.connected` state if the socket
     /// drops again before its waiter reacquires the mutex.
     connected_once: bool = false,
+    /// How many times this connection came back after a drop: bumped when a reconnect
+    /// completes, before the reconnected callback. The server forgets whatever a client
+    /// had parked on it (a pull request waiting for messages, see `PullRequest.epoch`),
+    /// so state that lives on the server side can tell it is gone by this counter.
+    reconnect_epoch: std.atomic.Value(u64) = .init(0),
 
     // Exit signal of the current runConnection iteration (protected by mutex)
     exit_signal: ?*ExitSignal = null,
@@ -1832,6 +1837,7 @@ pub const Connection = struct {
         // subscriptions restored and buffered publishes already queued ahead
         // of anything it sends (the flusher writes them out asynchronously).
         if (was_reconnect) {
+            _ = self.reconnect_epoch.fetchAdd(1, .release);
             if (self.options.callbacks.reconnected_cb) |cb| {
                 cb(self);
             }
