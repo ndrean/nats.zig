@@ -53,7 +53,7 @@ pub fn parseTimestamp(timestamp_str: []const u8) !Io.Timestamp {
         if (nanos_end > nanos_start) {
             const nanos_str = timestamp_str[nanos_start..nanos_end];
             // Pad or truncate to 9 digits (nanoseconds)
-            var nanos_buf: [9]u8 = .{'0'} ** 9;
+            var nanos_buf: [9]u8 = @splat('0');
             const copy_len = @min(nanos_str.len, 9);
             @memcpy(nanos_buf[0..copy_len], nanos_str[0..copy_len]);
             nanoseconds = try std.fmt.parseInt(u32, &nanos_buf, 10);

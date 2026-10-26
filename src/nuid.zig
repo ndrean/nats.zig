@@ -86,14 +86,14 @@ const GlobalNuid = struct {
     nuid: Nuid = .{},
 
     fn reset(self: *GlobalNuid) void {
-        std.Io.Threaded.mutexLock(&self.mutex);
+        std.Io.Threaded.mutexLockUncancelable(&self.mutex);
         defer std.Io.Threaded.mutexUnlock(&self.mutex);
 
         self.nuid = .{};
     }
 
     fn next(self: *GlobalNuid, buffer: *[NUID_TOTAL_LEN]u8) void {
-        std.Io.Threaded.mutexLock(&self.mutex);
+        std.Io.Threaded.mutexLockUncancelable(&self.mutex);
         defer std.Io.Threaded.mutexUnlock(&self.mutex);
 
         self.nuid.next(buffer);
@@ -224,7 +224,7 @@ test "thread safety" {
     const nuids_per_thread = 100;
     const total_nuids = thread_count * nuids_per_thread;
 
-    var results: [total_nuids]?[NUID_TOTAL_LEN]u8 = [_]?[NUID_TOTAL_LEN]u8{null} ** total_nuids;
+    var results: [total_nuids]?[NUID_TOTAL_LEN]u8 = @splat(null);
     var threads: [thread_count]std.Thread = undefined;
 
     // Create threads

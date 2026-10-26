@@ -25,16 +25,14 @@ pub fn build(b: *std.Build) void {
     };
 
     // Parse the ZON content at compile time, or use fallback values if parsing fails
-    var parsed_zon: BuildZon = undefined;
-    var should_free = false;
-    if (std.zon.parse.fromSliceAlloc(BuildZon, b.allocator, zon_content, null, .{})) |result| {
-        parsed_zon = result;
-        should_free = true;
-    } else |_| {
-        // Fallback values if parsing fails
-        parsed_zon = BuildZon{ .version = "0.0.0", .name = "nats.zig" };
-    }
-    defer if (should_free) std.zon.parse.free(b.allocator, parsed_zon);
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    const parsed_zon: BuildZon = std.zon.parse.fromSlice(BuildZon, .{
+        .gpa = b.allocator,
+        .arena = b.allocator,
+        .source = zon_content,
+        .diagnostics = &diagnostics,
+        .ignore_unknown_fields = true,
+    }) catch BuildZon{ .version = "0.0.0", .name = "nats.zig" };
 
     const xsync = b.dependency("xsync", .{
         .target = target,

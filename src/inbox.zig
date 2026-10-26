@@ -72,14 +72,14 @@ test "a prefix has to be usable as a subject" {
     try validatePrefix("_INBOX");
     try validatePrefix("_INBOX.alice");
     try validatePrefix("replies.eu-west");
-    try validatePrefix("x" ** max_prefix_len);
+    try validatePrefix(&@as([max_prefix_len]u8, @splat('x')));
 
     try std.testing.expectError(error.InvalidInboxPrefix, validatePrefix(""));
     try std.testing.expectError(error.InvalidInboxPrefix, validatePrefix("_INBOX."));
     try std.testing.expectError(error.InvalidInboxPrefix, validatePrefix("_INBOX.>"));
     try std.testing.expectError(error.InvalidInboxPrefix, validatePrefix("_INBOX.*"));
     try std.testing.expectError(error.InvalidInboxPrefix, validatePrefix("_INBOX alice"));
-    try std.testing.expectError(error.InvalidInboxPrefix, validatePrefix("x" ** (max_prefix_len + 1)));
+    try std.testing.expectError(error.InvalidInboxPrefix, validatePrefix(&@as([max_prefix_len + 1]u8, @splat('x'))));
 }
 
 test "inbox generation" {

@@ -243,7 +243,11 @@ test "tcpConnectToHost: a host name with one dead address still connects through
 /// call keeps the typed error set - including cancellation - intact.
 /// Returns the number of bytes written; short writes are possible.
 pub fn writeVec(io: Io, stream: net.Stream, data: []const []const u8) net.Stream.Writer.Error!usize {
-    return io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, data, 1);
+    const result = try io.operate(.{ .net_write = .{
+        .socket_handle = stream.socket.handle,
+        .data = data,
+    } });
+    return result.net_write;
 }
 
 /// Write all of `bytes` to the stream, looping over short writes.

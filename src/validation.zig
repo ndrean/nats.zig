@@ -307,8 +307,8 @@ test "validateStreamName" {
     try validateStreamName("mixed-Case_123");
 
     // 255 characters should be valid
-    const max_name = "a" ** 255;
-    try validateStreamName(max_name);
+    const max_name: [255]u8 = @splat('a');
+    try validateStreamName(&max_name);
 
     // Invalid names
     try std.testing.expectError(error.InvalidStreamName, validateStreamName(""));
@@ -321,8 +321,8 @@ test "validateStreamName" {
     try std.testing.expectError(error.InvalidStreamName, validateStreamName("name\twith\ttab"));
 
     // 256 characters should be invalid
-    const long_name = "a" ** 256;
-    try std.testing.expectError(error.InvalidStreamName, validateStreamName(long_name));
+    const long_name: [256]u8 = @splat('a');
+    try std.testing.expectError(error.InvalidStreamName, validateStreamName(&long_name));
 }
 
 test "validateConsumerName" {
