@@ -416,6 +416,11 @@ pub const ConnectionOptions = struct {
     /// credentials are picked up automatically. Takes precedence over
     /// `user_jwt` and `nkey_seed`.
     user_creds: ?[]const u8 = null,
+    /// The CONTENTS of a credentials (.creds) file, for a host that holds them in
+    /// memory (an app that received them at enrollment) rather than on disk. Used when
+    /// `user_creds` is not set; the caller owns the bytes and keeps them alive for the
+    /// connection's lifetime (every handshake reads them).
+    user_creds_content: ?[]const u8 = null,
     /// User JWT to present in CONNECT. Requires `nkey_seed` or
     /// `nkey_sign_cb` for signing the server nonce.
     user_jwt: ?[]const u8 = null,
@@ -703,6 +708,10 @@ pub const Connection = struct {
                 std.crypto.secureZero(u8, content);
                 self.allocator.free(content);
             }
+            const credentials = try creds_mod.parse(content);
+            var seed_kp = try nkeys.SeedKeyPair.fromSeed(credentials.seed);
+            seed_kp.wipe();
+        } else if (self.options.user_creds_content) |content| {
             const credentials = try creds_mod.parse(content);
             var seed_kp = try nkeys.SeedKeyPair.fromSeed(credentials.seed);
             seed_kp.wipe();
@@ -2336,6 +2345,10 @@ pub const Connection = struct {
         if (self.options.user_creds) |path| {
             const content = try Io.Dir.cwd().readFileAlloc(self.io, path, allocator, .limited(max_creds_file_size));
             creds_content = content;
+            const credentials = try creds_mod.parse(content);
+            jwt = credentials.jwt;
+            signing_seed = credentials.seed;
+        } else if (self.options.user_creds_content) |content| {
             const credentials = try creds_mod.parse(content);
             jwt = credentials.jwt;
             signing_seed = credentials.seed;
