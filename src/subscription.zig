@@ -65,6 +65,11 @@ pub const Subscription = struct {
     // incoming messages for this subscription are dropped and counted
     // (0 = unlimited). Defaults match nats.go.
     pending_msgs_limit: std.atomic.Value(u32) = std.atomic.Value(u32).init(default_pending_msgs_limit),
+    /// Another subscription whose reader is woken (its wait ends as a timeout would)
+    /// whenever a message arrives here: one thread can wait on one subscription and
+    /// still be told at once that this one has something. Set before messages flow;
+    /// the peer must outlive this subscription.
+    wake_on_message: ?*Subscription = null,
     pending_bytes_limit: AtomicU64 = AtomicU64.init(default_pending_bytes_limit),
     dropped_msgs: AtomicU64 = AtomicU64.init(0),
     slow_consumer: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),

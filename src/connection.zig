@@ -2283,6 +2283,7 @@ pub const Connection = struct {
             owns_message = false;
             // A successful delivery ends a slow-consumer episode.
             s.slow_consumer.store(false, .release);
+            if (s.wake_on_message) |peer| peer.messages.wake();
         } else {
             // No sub subscription found, try to send UNSUB command
             self.unsubscribeInternal(message.sid, null) catch |err| {
