@@ -739,7 +739,9 @@ pub const Connection = struct {
         while (true) {
             if (self.status == .closed) return error.ConnectionClosed;
             if (self.connected_once) {
-                log.info("Connected successfully", .{});
+                // Routine: the caller asked to connect and it did. The URL form below
+                // says the same thing once more; both are debug (NATS_ZIG_NOTES entry 9).
+                log.debug("Connected successfully", .{});
                 return;
             }
 
@@ -1757,7 +1759,9 @@ pub const Connection = struct {
 
         attempts.* = 0;
 
-        log.info("Connected successfully to {s}", .{server.parsed_url.full_url});
+        // A caller-initiated connect is not an event; a RE-connect after a drop is,
+        // and the reconnect machinery announces that at warn on its own.
+        log.debug("Connected successfully to {s}", .{server.parsed_url.full_url});
 
         // Invoke reconnected callback last, so it observes a connection with
         // subscriptions restored and buffered publishes already queued ahead

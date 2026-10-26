@@ -1369,7 +1369,7 @@ pub const JetStream = struct {
         if (config.name) |n| try validation.validateConsumerName(n);
         if (config.durable_name) |n| try validation.validateConsumerName(n);
 
-        log.info("adding consumer", .{});
+        log.debug("adding consumer", .{});
         // LOCAL FIX (see NOTES.md): a NAMED consumer uses the modern
         // CONSUMER.CREATE.<stream>.<name>[.<filter>] endpoint (server >= 2.9)
         // instead of the legacy CONSUMER.DURABLE.CREATE API. Least-privilege
