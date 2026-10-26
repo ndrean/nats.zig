@@ -347,3 +347,43 @@ test "JetStream shared pull inbox: a long request expiry parks one request, and 
     try testing.expectEqualStrings("late", mb.messages[0].msg.data);
     try mb.messages[0].ack();
 }
+
+test "JetStream pull subscribe creates its consumer without asking CONSUMER.INFO first" {
+    const io = std.testing.io;
+    const nc = try utils.createDefaultConnection(io);
+    defer utils.closeConnection(nc);
+    var js = nc.jetstream(.{});
+    // A second connection hears the API requests of the first.
+    const watcher = try utils.createDefaultConnection(io);
+    defer utils.closeConnection(watcher);
+    const infos = try watcher.subscribeSync("$JS.API.CONSUMER.INFO.TEST_CREATE_FIRST.>");
+    defer infos.deinit();
+    const creates = try watcher.subscribeSync("$JS.API.CONSUMER.CREATE.TEST_CREATE_FIRST.>");
+    defer creates.deinit();
+    try watcher.flush();
+
+    var info = try js.addStream(.{ .name = "TEST_CREATE_FIRST", .subjects = &[_][]const u8{"test.create.first.*"}, .storage = .memory });
+    defer info.deinit();
+    defer js.deleteStream("TEST_CREATE_FIRST") catch {};
+
+    // A new durable, then the same one again: both succeed (the second create is
+    // idempotent), and neither asks whether it exists.
+    var sub1 = try js.pullSubscribe("test.create.first.*", "create_first", .{ .stream = "TEST_CREATE_FIRST" });
+    defer sub1.deinit();
+    var sub2 = try js.pullSubscribe("test.create.first.*", "create_first", .{ .stream = "TEST_CREATE_FIRST" });
+    defer sub2.deinit();
+
+    var n_create: usize = 0;
+    while (creates.nextMsgTimeout(utils.ioTimeout(.fromMilliseconds(300)))) |m| {
+        m.deinit();
+        n_create += 1;
+    } else |_| {}
+    var n_info: usize = 0;
+    while (infos.nextMsgTimeout(utils.ioTimeout(.fromMilliseconds(300)))) |m| {
+        m.deinit();
+        n_info += 1;
+    } else |_| {}
+    std.debug.print("two pull subscribes to one durable: {d} CONSUMER.CREATE, {d} CONSUMER.INFO\n", .{ n_create, n_info });
+    try testing.expectEqual(@as(usize, 2), n_create);
+    try testing.expectEqual(@as(usize, 0), n_info);
+}
