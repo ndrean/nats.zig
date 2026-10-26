@@ -52,6 +52,8 @@ pub const JetStreamSubscription = @import("jetstream.zig").JetStreamSubscription
 pub const PullSubscription = @import("jetstream.zig").PullSubscription;
 pub const FetchRequest = @import("jetstream.zig").FetchRequest;
 pub const MessageBatch = @import("jetstream.zig").MessageBatch;
+pub const PullInbox = @import("jetstream.zig").PullInbox;
+pub const MultiBatch = @import("jetstream.zig").MultiBatch;
 
 // JetStream KV types
 pub const KV = @import("jetstream_kv.zig").KV;
