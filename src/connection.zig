@@ -1664,6 +1664,7 @@ pub const Connection = struct {
         errdefer stream.close(self.io);
 
         try net_util.setKeepAlive(stream.socket, true);
+        try net_util.setNoDelay(stream.socket, true);
 
         if (self.options.trace) {
             log.debug("Connected, starting handshake...", .{});
