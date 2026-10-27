@@ -70,6 +70,7 @@ pub const KVError = @import("jetstream_kv.zig").KVError;
 pub const validateStreamName = @import("validation.zig").validateStreamName;
 pub const validateConsumerName = @import("validation.zig").validateConsumerName;
 pub const validateSubject = @import("validation.zig").validateSubject;
+pub const max_subject_len = @import("validation.zig").max_subject_len;
 pub const validateQueueName = @import("validation.zig").validateQueueName;
 pub const validateKVBucketName = @import("validation.zig").validateKVBucketName;
 pub const validateKVKeyName = @import("validation.zig").validateKVKeyName;

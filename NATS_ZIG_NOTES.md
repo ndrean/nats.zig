@@ -1330,3 +1330,11 @@ green over 37.
 **Change** (`41-nats.zig-zig-017.patch`, 8 files, 12 hunks): `build.zig` (`std.zon.parse.fromSlice` with its options struct), `src/net_util.zig` (`writeVec` through `io.operate(.net_write)`, `Io.VTable.netWrite` is gone), `src/nuid.zig` (`mutexLockUncancelable`), `src/root.zig`, `src/timestamp.zig`, `src/validation.zig`, `src/inbox.zig` (`**` → `@splat`), `test_runner.zig`. Cut as the diff of those files between upstream plus patches 01–40 and the working tree: `new-patch.sh` cuts `src/` and `tests/` only, and this patch also touches `build.zig` and `test_runner.zig`. The xsync patch the parked branch carried is gone: patch 39 pins xsync v1.0.1, which builds on both.
 
 **Verified on 0.17.0:** nats.zig `test-unit` 143/143, the bridge 410/410, libzb 48 passed and 2 skipped. `check-series.sh` green over 40 files, and a clean apply reproduces `build.zig`, `build.zig.zon` and `test_runner.zig` byte for byte. The switch is a clean break: this patch does not build on 0.16.
+
+## 43. Patch 42: a subject may be longer than 255 bytes (2026-10-27)
+
+**How it appeared.** ZeBridge's troubleshooting work (a tenant id of 93 bytes got rows on its CDC stream and no generation chain ever) traced to `$JS.API.CONSUMER.CREATE.OBJ_gen-<tenant>.<name>.$O.gen-<tenant>.C.>`, which carries the tenant twice and passed 255 bytes. The limit was nats.zig's, not the server's: `validateSubject` applied the 255 of the NAME rules (ADR-6: stream, consumer and bucket names) to subjects.
+
+**Measured against nats-server 2.15.1** (nats-py, an isolated server): a core subject of 3000 bytes is delivered; an object store with a 240-byte tenant (bucket `gen-<tenant>`) puts and gets; a named consumer created with a 547-byte API subject is created. The server bounds the protocol line by `max_control_line` (4096 by default).
+
+**Change** (`src/validation.zig`, `src/root.zig`): `max_subject_len = 1024` (exported, so a caller can derive its own limits from it) replaces the literal 255 in `validateSubject`; names keep 255. A test pins a 300-byte subject, the consumer-create subject for a 128-byte tenant, and the bound itself.

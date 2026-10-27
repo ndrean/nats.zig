@@ -103,13 +103,28 @@ pub fn validateQueueName(name: []const u8) !void {
     }
 }
 
+/// The longest subject the client sends, in bytes.
+///
+/// ⚠️ This was 255, borrowed from the NAME rules above (stream, consumer and bucket names are
+/// limited to 255 by ADR-6). A subject has no such limit on the wire: nats-server bounds the whole
+/// protocol line by `max_control_line` (4096 by default), and nats.go checks no length at all.
+/// Measured against nats-server 2.15.1: a core subject of 3000 bytes is delivered, and
+/// JetStream's API subjects of 550 bytes are served (an object store whose bucket name is 240
+/// bytes, a named consumer created with its filter in the subject). The old limit refused
+/// ZeBridge's own `$JS.API.CONSUMER.CREATE.OBJ_gen-<tenant>.<name>.$O.gen-<tenant>.C.>` for a tenant
+/// of 93 bytes, which the server would have served, long before it mattered.
+///
+/// 1024 keeps a quarter of the default control line free for the reply subject and the sizes.
+/// A server configured with a smaller `max_control_line` still refuses what it cannot take.
+pub const max_subject_len: usize = 1024;
+
 /// Validate subject according to ADR-6: term (dot term | asterisk)* (dot gt)?
 pub fn validateSubject(subject: []const u8) !void {
     if (subject.len == 0) {
         return error.InvalidSubject;
     }
 
-    if (subject.len > 255) {
+    if (subject.len > max_subject_len) {
         return error.InvalidSubject;
     }
 
@@ -352,6 +367,23 @@ test "validateSubject" {
     try std.testing.expectError(error.InvalidSubject, validateSubject("foo."));
     try std.testing.expectError(error.InvalidSubject, validateSubject("foo bar"));
     try std.testing.expectError(error.InvalidSubject, validateSubject("foo\nbar"));
+}
+
+test "validateSubject: a subject is not a name, so 255 bytes is not its limit" {
+    const long: [300]u8 = @splat('a');
+    var buf: [1100]u8 = undefined;
+    // 300 bytes in two tokens
+    const two = try std.fmt.bufPrint(&buf, "{s}.{s}", .{ long[0..149], long[0..149] });
+    try validateSubject(two);
+    // The consumer-create subject for a 128-byte tenant: 300+ bytes
+    const api = try std.fmt.bufPrint(&buf, "$JS.API.CONSUMER.CREATE.OBJ_gen-{s}.zbz0123456789abcdef.$O.gen-{s}.C.>", .{ long[0..128], long[0..128] });
+    try std.testing.expect(api.len > 300);
+    try validateSubject(api);
+    // the bound itself
+    const at: [max_subject_len]u8 = @splat('a');
+    try validateSubject(&at);
+    const over: [max_subject_len + 1]u8 = @splat('a');
+    try std.testing.expectError(error.InvalidSubject, validateSubject(&over));
 }
 
 test "validateKVBucketName" {
