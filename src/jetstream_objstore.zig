@@ -166,6 +166,12 @@ pub const ObjectStoreConfig = struct {
     compression: bool = false,
     /// Chunk size
     chunk_size: u32 = DEFAULT_CHUNK_SIZE,
+    /// How long an object lives, in NANOSECONDS; 0 keeps it for ever (the default, and
+    /// what every store created before this got). It is the backing stream's `max_age`,
+    /// which the store's own config had no way to set — so a bucket of TRANSIENT
+    /// objects (an answer too large for one message, a cache) had to be swept by hand.
+    /// nats.go spells it `TTL` on ObjectStoreConfig.
+    max_age_ns: u64 = 0,
 };
 
 /// ObjectResult provides streaming access to object data with integrated reading capabilities
@@ -518,7 +524,13 @@ pub const ObjectStore = struct {
         const meta_msg = self.js.getMsg(self.stream_name, .{ .last_by_subj = meta_subject, .direct = true }) catch |err| {
             return if (err == error.MessageNotFound) ObjectStoreError.ObjectNotFound else err;
         };
-        errdefer meta_msg.deinit();
+        // Released exactly once: explicitly once parsed, or here on an earlier failure.
+        // An unconditional errdefer released it a SECOND time when a deleted object
+        // returned an error after the explicit release — the pool then freed a pointer
+        // it no longer owned at connection teardown (measured through libzb: the host
+        // process aborting in zb_client_close after a failed seed).
+        var meta_msg_owned = true;
+        errdefer if (meta_msg_owned) meta_msg.deinit();
 
         // Create arena for the result
         const arena = try self.allocator.create(std.heap.ArenaAllocator);
@@ -547,6 +559,7 @@ pub const ObjectStore = struct {
 
         // We can safely deinit the message now since all strings are owned by arena
         meta_msg.deinit();
+        meta_msg_owned = false;
 
         if (obj_info.deleted) {
             return ObjectStoreError.ObjectNotFound;
@@ -565,7 +578,7 @@ pub const ObjectStore = struct {
         const chunk_subject = try self.getChunkSubject(obj_info.nuid);
         defer self.allocator.free(chunk_subject);
 
-        const inbox = try newInbox(self.allocator);
+        const inbox = try self.js.nc.newInbox(self.allocator);
         defer self.allocator.free(inbox);
 
         const consumer_config = ConsumerConfig{
@@ -600,7 +613,8 @@ pub const ObjectStore = struct {
         const arena_allocator = arena.allocator();
 
         // Allocate buffer for complete object based on size from info
-        const data = try arena_allocator.alloc(u8, result.info.size);
+        // usize on 32-bit targets: an object larger than the address space cannot be held whole.
+        const data = try arena_allocator.alloc(u8, std.math.cast(usize, result.info.size) orelse return error.OutOfMemory);
 
         // Read all data from the streaming result
         var total_read: usize = 0;
@@ -644,7 +658,13 @@ pub const ObjectStore = struct {
         const meta_msg = self.js.getMsg(self.stream_name, .{ .last_by_subj = meta_subject, .direct = true }) catch |err| {
             return if (err == error.MessageNotFound) ObjectStoreError.ObjectNotFound else err;
         };
-        errdefer meta_msg.deinit();
+        // Released exactly once: explicitly once parsed, or here on an earlier failure.
+        // An unconditional errdefer released it a SECOND time when a deleted object
+        // returned an error after the explicit release — the pool then freed a pointer
+        // it no longer owned at connection teardown (measured through libzb: the host
+        // process aborting in zb_client_close after a failed seed).
+        var meta_msg_owned = true;
+        errdefer if (meta_msg_owned) meta_msg.deinit();
 
         const arena = try self.allocator.create(std.heap.ArenaAllocator);
         errdefer self.allocator.destroy(arena);
@@ -672,6 +692,7 @@ pub const ObjectStore = struct {
 
         // We can safely deinit the message now since all strings are owned by arena
         meta_msg.deinit();
+        meta_msg_owned = false;
 
         return Result(ObjectInfo){
             .arena = arena,
@@ -721,7 +742,7 @@ pub const ObjectStore = struct {
         const meta_filter = try std.fmt.allocPrint(self.allocator, "{s}>", .{self.meta_subject_prefix});
         defer self.allocator.free(meta_filter);
 
-        const inbox = try newInbox(self.allocator);
+        const inbox = try self.js.nc.newInbox(self.allocator);
         defer self.allocator.free(inbox);
 
         const consumer_config = ConsumerConfig{
@@ -848,6 +869,7 @@ pub const ObjectStoreManager = struct {
             .compression = if (config.compression) .s2 else .none,
             .num_replicas = config.replicas,
             .discard = .new,
+            .max_age = config.max_age_ns,
             .allow_direct = true,
             .allow_rollup_hdrs = true,
         };

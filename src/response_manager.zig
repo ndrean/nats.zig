@@ -44,14 +44,18 @@ pub const RequestHandle = struct {
     rid: u64,
 };
 
-const INBOX_BASE_PREFIX = "_INBOX.";
-const INBOX_BASE_PREFIX_LEN = INBOX_BASE_PREFIX.len;
-
-const INBOX_PREFIX_LEN = INBOX_BASE_PREFIX_LEN + nuid.NUID_TOTAL_LEN + 1; // "_INBOX.{22-char-nuid}." = 7 + 22 + 1 = 30
+// "<prefix>.{22-char-nuid}." at its longest. The reply prefix lives in an
+// inline buffer, so the prefix is bounded by inbox.max_prefix_len rather than
+// allocated; the default "_INBOX" uses 30 of these bytes.
+const INBOX_PREFIX_LEN = inbox.max_prefix_len + 1 + nuid.NUID_TOTAL_LEN + 1;
 
 pub const ResponseManager = struct {
     allocator: Allocator,
     io: Io,
+
+    /// The connection's inbox prefix, without its trailing dot. Borrowed from
+    /// ConnectionOptions, which the caller keeps alive, like `name` and `user`.
+    inbox_prefix: []const u8 = inbox.default_prefix,
 
     resp_sub_prefix_buf: [INBOX_PREFIX_LEN]u8 = undefined,
     resp_sub_prefix: []u8 = &.{},
@@ -73,10 +77,11 @@ pub const ResponseManager = struct {
     // Request ID generation state (simple counter)
     rid_counter: u64 = 0,
 
-    pub fn init(allocator: Allocator, io: Io) ResponseManager {
+    pub fn init(allocator: Allocator, io: Io, inbox_prefix: []const u8) ResponseManager {
         return ResponseManager{
             .allocator = allocator,
             .io = io,
+            .inbox_prefix = inbox_prefix,
         };
     }
 
@@ -147,7 +152,10 @@ pub const ResponseManager = struct {
         // Create an unique identifier for the response manager
         var nuid_buf: [nuid.NUID_TOTAL_LEN]u8 = undefined;
         nuid.next(&nuid_buf);
-        self.resp_sub_prefix = std.fmt.bufPrint(&self.resp_sub_prefix_buf, "_INBOX.{s}.", .{&nuid_buf}) catch unreachable;
+        // Connection.connect validates the prefix against inbox.max_prefix_len,
+        // so the buffer fits; a ResponseManager built by hand with a longer one
+        // is told, rather than panicking.
+        self.resp_sub_prefix = std.fmt.bufPrint(&self.resp_sub_prefix_buf, "{s}.{s}.", .{ self.inbox_prefix, &nuid_buf }) catch return error.InvalidInboxPrefix;
 
         // Create wildcard subscription using a temporary buffer
         var subject_buf: [INBOX_PREFIX_LEN + 1]u8 = undefined;
@@ -448,7 +456,7 @@ test "response manager basic functionality" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var manager = ResponseManager.init(allocator, std.testing.io);
+    var manager = ResponseManager.init(allocator, std.testing.io, inbox.default_prefix);
     defer manager.deinit();
 
     // Test that we can create request handles with different rids
@@ -467,7 +475,7 @@ test "request handle timeout functionality" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var manager = ResponseManager.init(allocator, std.testing.io);
+    var manager = ResponseManager.init(allocator, std.testing.io, inbox.default_prefix);
     defer manager.deinit();
 
     const handle = try manager.createRequest();
@@ -487,7 +495,7 @@ test "multi-response request creation and timeout" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var manager = ResponseManager.init(allocator, std.testing.io);
+    var manager = ResponseManager.init(allocator, std.testing.io, inbox.default_prefix);
     defer manager.deinit();
 
     // Test that we can create multi-response request handles
@@ -517,7 +525,7 @@ test "multi-response returns collected messages when manager closes" {
     };
 
     const io = std.testing.io;
-    var manager = ResponseManager.init(std.testing.allocator, io);
+    var manager = ResponseManager.init(std.testing.allocator, io, inbox.default_prefix);
     defer manager.deinit();
 
     const handle = try manager.createMultiRequest();

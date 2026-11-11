@@ -52,11 +52,15 @@ pub const JetStreamSubscription = @import("jetstream.zig").JetStreamSubscription
 pub const PullSubscription = @import("jetstream.zig").PullSubscription;
 pub const FetchRequest = @import("jetstream.zig").FetchRequest;
 pub const MessageBatch = @import("jetstream.zig").MessageBatch;
+pub const PullInbox = @import("jetstream.zig").PullInbox;
+pub const MultiBatch = @import("jetstream.zig").MultiBatch;
 
 // JetStream KV types
 pub const KV = @import("jetstream_kv.zig").KV;
 pub const KVManager = @import("jetstream_kv.zig").KVManager;
 pub const KVEntry = @import("jetstream_kv.zig").KVEntry;
+pub const KVWatcher = @import("jetstream_kv.zig").KVWatcher;
+pub const WatchOptions = @import("jetstream_kv.zig").WatchOptions;
 pub const KVStatus = @import("jetstream_kv.zig").KVStatus;
 pub const KVConfig = @import("jetstream_kv.zig").KVConfig;
 pub const PutOptions = @import("jetstream_kv.zig").PutOptions;
@@ -66,6 +70,7 @@ pub const KVError = @import("jetstream_kv.zig").KVError;
 pub const validateStreamName = @import("validation.zig").validateStreamName;
 pub const validateConsumerName = @import("validation.zig").validateConsumerName;
 pub const validateSubject = @import("validation.zig").validateSubject;
+pub const max_subject_len = @import("validation.zig").max_subject_len;
 pub const validateQueueName = @import("validation.zig").validateQueueName;
 pub const validateKVBucketName = @import("validation.zig").validateKVBucketName;
 pub const validateKVKeyName = @import("validation.zig").validateKVKeyName;
@@ -93,6 +98,7 @@ pub const creds = @import("creds.zig");
 test {
     std.testing.refAllDecls(@This());
     _ = @import("net_util.zig");
+    _ = @import("atomic_u64.zig");
     // The TLS tests run a real tls.zig server, which the stub module does
     // not provide; with TLS compiled out the whole file is skipped.
     if (@import("build_options").use_tls) {
@@ -114,14 +120,14 @@ test {
 /// the interesting declarations are methods on re-exported types rather than
 /// on this module.
 fn refAllDeclsRecursive(comptime T: type) void {
-    inline for (comptime std.meta.declarations(T)) |decl| {
-        if (@TypeOf(@field(T, decl.name)) == type) {
-            switch (@typeInfo(@field(T, decl.name))) {
-                .@"struct", .@"enum", .@"union", .@"opaque" => refAllDeclsRecursive(@field(T, decl.name)),
+    inline for (comptime std.meta.declarations(T)) |decl_name| {
+        if (@TypeOf(@field(T, decl_name)) == type) {
+            switch (@typeInfo(@field(T, decl_name))) {
+                .@"struct", .@"enum", .@"union", .@"opaque" => refAllDeclsRecursive(@field(T, decl_name)),
                 else => {},
             }
         }
-        _ = &@field(T, decl.name);
+        _ = &@field(T, decl_name);
     }
 }
 

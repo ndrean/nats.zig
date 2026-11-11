@@ -12,6 +12,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const AtomicU64 = @import("atomic_u64.zig").AtomicU64;
 const net = std.Io.net;
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
@@ -337,6 +338,18 @@ const TlsRuntime = struct {
     }
 };
 
+/// Which cipher suites the ClientHello offers, and with them which TLS
+/// versions the handshake can land on.
+///
+///   * `.default` — TLS 1.3 and 1.2, the 1.3 suites first, including 1.2's
+///     older CBC suites. What tls.zig offers when nothing is said.
+///   * `.secure` — TLS 1.3 and 1.2, recommended suites only: the CBC suites
+///     are not offered.
+///   * `.tls13` — TLS 1.3 only. The handshake is one round trip, there is no
+///     1.2 fallback to negotiate, and a downgrade cannot be offered at all.
+///     Refuse rather than fall back when the server has no 1.3.
+pub const CipherSuites = enum { default, secure, tls13 };
+
 pub const TlsOptions = struct {
     /// Path to a PEM CA bundle used to verify the server certificate,
     /// resolved against the current working directory. When null, the
@@ -364,6 +377,10 @@ pub const TlsOptions = struct {
     /// for servers running in handshake-first mode or behind
     /// TLS-terminating proxies.
     handshake_first: bool = false,
+    /// Which cipher suites to offer, and so which TLS versions can be
+    /// negotiated. The default offers TLS 1.3 and 1.2; `.tls13` offers
+    /// 1.3 alone.
+    cipher_suites: CipherSuites = .default,
 };
 
 pub const ConnectionOptions = struct {
@@ -400,6 +417,11 @@ pub const ConnectionOptions = struct {
     /// credentials are picked up automatically. Takes precedence over
     /// `user_jwt` and `nkey_seed`.
     user_creds: ?[]const u8 = null,
+    /// The CONTENTS of a credentials (.creds) file, for a host that holds them in
+    /// memory (an app that received them at enrollment) rather than on disk. Used when
+    /// `user_creds` is not set; the caller owns the bytes and keeps them alive for the
+    /// connection's lifetime (every handshake reads them).
+    user_creds_content: ?[]const u8 = null,
     /// User JWT to present in CONNECT. Requires `nkey_seed` or
     /// `nkey_sign_cb` for signing the server nonce.
     user_jwt: ?[]const u8 = null,
@@ -410,6 +432,20 @@ pub const ConnectionOptions = struct {
     /// signature. Used with `nkey` (or `user_jwt`) instead of `nkey_seed`;
     /// a configured seed takes precedence.
     nkey_sign_cb: ?*const fn (nonce: []const u8) anyerror![64]u8 = null,
+
+    /// Prefix for the inboxes this client generates — the reply subject of a
+    /// request, and the delivery subject of a KV watcher, an object-store read
+    /// or a pull consumer. Without its trailing dot; the dot is added.
+    ///
+    /// The default is every NATS client's `_INBOX`, and every client on an
+    /// account then listens under one shared prefix, so a permission narrow
+    /// enough to isolate replies cannot be written. A deployment that grants
+    /// `_INBOX.<principal>.>` per principal sets this to `_INBOX.<principal>`
+    /// and its replies stay inside that grant. Same option as nats.go's
+    /// `CustomInboxPrefix`, nats.js's `inboxPrefix` and nats-py's
+    /// `inbox_prefix`. Validated at connect: non-empty, no wildcard, no
+    /// whitespace, no trailing dot, at most `inbox.max_prefix_len` bytes.
+    inbox_prefix: []const u8 = inbox.default_prefix,
 
     /// TLS configuration. When set, every connection is upgraded to TLS
     /// after the plaintext INFO (or before it, with `handshake_first`).
@@ -432,11 +468,22 @@ pub const Connection = struct {
     options: ConnectionOptions,
 
     status: ConnectionStatus = .initialized,
+    /// Set when the connection gave up because the server rejected the credentials
+    /// twice (expired/revoked/violation). Readable after close so callers can turn
+    /// "ConnectionClosed" into an actionable auth verdict.
+    final_auth_error: ?anyerror = null,
     status_cond: xsync.Condition = .init,
     /// Latched when the first NATS handshake and restoration complete, so
     /// connect() cannot miss a short-lived `.connected` state if the socket
     /// drops again before its waiter reacquires the mutex.
     connected_once: bool = false,
+    /// How many times this connection came back after a drop: bumped when a reconnect
+    /// completes, before the reconnected callback. The server forgets whatever a client
+    /// had parked on it (a pull request waiting for messages, see `PullRequest.epoch`),
+    /// so state that lives on the server side can tell it is gone by this counter.
+    /// u32, not u64: a 32-bit target (Android armv7) has no 64-bit atomics, and the
+    /// epoch is only ever compared for equality.
+    reconnect_epoch: std.atomic.Value(u32) = .init(0),
 
     // Exit signal of the current runConnection iteration (protected by mutex)
     exit_signal: ?*ExitSignal = null,
@@ -496,7 +543,7 @@ pub const Connection = struct {
     write_buffer: WriteBuffer,
 
     // Subscriptions
-    next_sid: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
+    next_sid: AtomicU64 = AtomicU64.init(1),
     subscriptions: std.AutoHashMap(u64, *Subscription),
     // Guards `subscriptions`. Acquired after `mutex` when both are held; see
     // the lock-order note on `mutex`.
@@ -535,7 +582,7 @@ pub const Connection = struct {
             .pending_buffer = WriteBuffer.init(allocator, io, .{ .max_size = options.reconnect.reconnect_buf_size }),
             .write_buffer = WriteBuffer.init(allocator, io, .{ .max_size = options.write_buffer_limit, .soft_limit = true }),
             .subscriptions = std.AutoHashMap(u64, *Subscription).init(allocator),
-            .response_manager = ResponseManager.init(allocator, io),
+            .response_manager = ResponseManager.init(allocator, io, options.inbox_prefix),
             .parser = Parser.init(allocator, io),
             .scratch = std.heap.ArenaAllocator.init(allocator),
             .ping_time = io_util.now(io),
@@ -641,6 +688,10 @@ pub const Connection = struct {
 
         try io_util.ensureAwakeClock(self.io);
 
+        // An inbox prefix that is not a usable subject would otherwise surface
+        // as a silent permissions violation on the first reply.
+        try inbox.validatePrefix(self.options.inbox_prefix);
+
         // Fail fast at the API boundary when TLS is requested but was
         // compiled out; tls:// URLs are additionally checked per attempt
         // in runConnection.
@@ -665,6 +716,10 @@ pub const Connection = struct {
                 std.crypto.secureZero(u8, content);
                 self.allocator.free(content);
             }
+            const credentials = try creds_mod.parse(content);
+            var seed_kp = try nkeys.SeedKeyPair.fromSeed(credentials.seed);
+            seed_kp.wipe();
+        } else if (self.options.user_creds_content) |content| {
             const credentials = try creds_mod.parse(content);
             var seed_kp = try nkeys.SeedKeyPair.fromSeed(credentials.seed);
             seed_kp.wipe();
@@ -735,7 +790,9 @@ pub const Connection = struct {
         while (true) {
             if (self.status == .closed) return error.ConnectionClosed;
             if (self.connected_once) {
-                log.info("Connected successfully", .{});
+                // Routine: the caller asked to connect and it did. The URL form below
+                // says the same thing once more; both are debug (NATS_ZIG_NOTES entry 9).
+                log.debug("Connected successfully", .{});
                 return;
             }
 
@@ -793,11 +850,21 @@ pub const Connection = struct {
     /// does not join manager_task: a callback may itself be running in that
     /// task (or in a reader task the manager is joining). deinit() is the
     /// synchronous join-and-destroy boundary.
+    /// The auth error that terminally closed this connection, if any.
+    pub fn lastAuthError(self: *Self) ?anyerror {
+        return self.final_auth_error;
+    }
+
     pub fn close(self: *Self) void {
         var callback: @TypeOf(self.options.callbacks.closed_cb) = null;
         defer if (callback) |cb| cb(self);
 
-        log.info("Closing connection", .{});
+        // Debug, not info: this is the DELIBERATE close (the bridge's generation
+        // producer opens a fresh connection per tick and closes it on the way out), and
+        // at info the pair "Closing connection / Disconnected" reads like an incident
+        // every cadence. A real drop logs "Connection failed: {err}" and the reconnect
+        // machinery speaks at warn.
+        log.debug("Closing connection", .{});
 
         self.mutex.lockUncancelable(self.io);
         if (self.status == .closed) {
@@ -852,6 +919,18 @@ pub const Connection = struct {
     /// - Rebalancing client connections
     /// - Testing reconnection behavior
     /// Returns error if reconnection cannot be initiated
+    /// Replace the in-memory credentials (`user_creds_content`) the NEXT handshake
+    /// reads — a renewed JWT, same seed. Under the connection mutex, which every
+    /// handshake holds, so a reconnect in flight sees the old bytes or the new ones,
+    /// never half of each. The caller owns `content` and keeps it alive; the previous
+    /// bytes may be freed once this returns. The current connection is not touched:
+    /// the server ends it when its JWT expires, and the reconnect presents the new one.
+    pub fn setCredsContent(self: *Self, content: []const u8) !void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        self.options.user_creds_content = content;
+    }
+
     pub fn reconnect(self: *Self) !void {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
@@ -1196,15 +1275,24 @@ pub const Connection = struct {
         // Try to send UNSUB command. Even if it fails internally,
         // processMsg will keep sending UNSUB commands once
         // it receives a message with unknown sid.
-        self.unsubscribeInternal(sub.sid, null) catch |err| {
-            if (err == error.Canceled) {
-                // This is a void-returning cleanup path; re-arm the
-                // cancelation so the caller's next cancelation point
-                // still observes it.
-                self.io.recancel();
-            } else {
-                log.err("Failed to send UNSUB for sid {d}: {}", .{ sub.sid, err });
-            }
+        self.unsubscribeInternal(sub.sid, null) catch |err| switch (err) {
+            // This is a void-returning cleanup path; re-arm the cancelation so the
+            // caller's next cancelation point still observes it.
+            error.Canceled => self.io.recancel(),
+
+            // Expected during shutdown, and not a failure: UNSUB on a closed socket
+            // cannot succeed and does not need to — the server drops every subscription
+            // when the connection goes. Reported at error level, this printed once per
+            // subscription on every clean exit ("Failed to send UNSUB for sid 1:
+            // error.Closed", three times for a bridge with three subscribers), *after*
+            // the connection had already been logged as closed. An expected condition
+            // logged as an error trains operators to ignore the level.
+            error.Closed => log.debug(
+                "connection already closed; UNSUB for sid {d} not sent (the server drops it anyway)",
+                .{sub.sid},
+            ),
+
+            else => log.err("Failed to send UNSUB for sid {d}: {}", .{ sub.sid, err }),
         };
 
         log.debug("Unsubscribed from {s} with sid {d}", .{ sub.subject, sub.sid });
@@ -1280,6 +1368,14 @@ pub const Connection = struct {
             .arena = undefined,
         };
         return self.requestMsg(&msg, timeout);
+    }
+
+    /// A fresh inbox subject under this connection's prefix:
+    /// `<inbox_prefix>.<22-char-nuid>`. Every inbox this library generates goes
+    /// through here, so a narrowed prefix covers replies, KV watchers,
+    /// object-store reads and pull consumers alike. The caller owns the result.
+    pub fn newInbox(self: *Self, allocator: Allocator) ![]u8 {
+        return inbox.newInboxWithPrefix(allocator, self.options.inbox_prefix);
     }
 
     pub fn requestMsg(self: *Self, msg: *Message, timeout: Io.Timeout) !*Message {
@@ -1410,7 +1506,10 @@ pub const Connection = struct {
                 if (conn_err) |err| {
                     log.info("Connection failed: {}", .{err});
                 } else {
-                    log.info("Disconnected", .{});
+                    // Debug for the same reason as close(): no error means this end hung
+                    // up on purpose. An unexpected server-side EOF lands here too, but
+                    // the reconnect path announces itself immediately after at warn.
+                    log.debug("Disconnected", .{});
                 }
 
                 // close() claims the terminal state before canceling the
@@ -1572,6 +1671,7 @@ pub const Connection = struct {
         errdefer stream.close(self.io);
 
         try net_util.setKeepAlive(stream.socket, true);
+        try net_util.setNoDelay(stream.socket, true);
 
         if (self.options.trace) {
             log.debug("Connected, starting handshake...", .{});
@@ -1688,6 +1788,10 @@ pub const Connection = struct {
             if (isAuthError(err)) {
                 if (server.last_auth_error) |last| {
                     if (last == err) {
+                        // Remember WHY before giving up: a caller that later finds the
+                        // connection closed can name the cause ("authentication
+                        // expired — re-enroll") instead of a generic ConnectionClosed.
+                        self.final_auth_error = err;
                         self.mutex.unlock(self.io);
                         log.err("Same authentication error twice from {s}, giving up: {}", .{ server.parsed_url.full_url, err });
                         return error.ShouldClose;
@@ -1727,12 +1831,15 @@ pub const Connection = struct {
 
         attempts.* = 0;
 
-        log.info("Connected successfully to {s}", .{server.parsed_url.full_url});
+        // A caller-initiated connect is not an event; a RE-connect after a drop is,
+        // and the reconnect machinery announces that at warn on its own.
+        log.debug("Connected successfully to {s}", .{server.parsed_url.full_url});
 
         // Invoke reconnected callback last, so it observes a connection with
         // subscriptions restored and buffered publishes already queued ahead
         // of anything it sends (the flusher writes them out asynchronously).
         if (was_reconnect) {
+            _ = self.reconnect_epoch.fetchAdd(1, .release);
             if (self.options.callbacks.reconnected_cb) |cb| {
                 cb(self);
             }
@@ -1967,6 +2074,11 @@ pub const Connection = struct {
         var hs = tls.nonblock.Client.init(.{
             .host = rt.host,
             .root_ca = bundle,
+            .cipher_suites = switch (rt.opts.cipher_suites) {
+                .default => tls.config.cipher_suites.all,
+                .secure => tls.config.cipher_suites.secure,
+                .tls13 => tls.config.cipher_suites.tls13,
+            },
             .insecure_skip_verify = rt.opts.insecure_skip_verify,
             .auth = if (client_auth) |*auth| auth else null,
             .rng = rt.rng.interface(),
@@ -2180,6 +2292,7 @@ pub const Connection = struct {
             owns_message = false;
             // A successful delivery ends a slow-consumer episode.
             s.slow_consumer.store(false, .release);
+            if (s.wake_on_message) |peer| peer.messages.wake();
         } else {
             // No sub subscription found, try to send UNSUB command
             self.unsubscribeInternal(message.sid, null) catch |err| {
@@ -2255,6 +2368,10 @@ pub const Connection = struct {
         if (self.options.user_creds) |path| {
             const content = try Io.Dir.cwd().readFileAlloc(self.io, path, allocator, .limited(max_creds_file_size));
             creds_content = content;
+            const credentials = try creds_mod.parse(content);
+            jwt = credentials.jwt;
+            signing_seed = credentials.seed;
+        } else if (self.options.user_creds_content) |content| {
             const credentials = try creds_mod.parse(content);
             jwt = credentials.jwt;
             signing_seed = credentials.seed;
@@ -2472,6 +2589,12 @@ pub const Connection = struct {
         const protocol_err = parseProtocolError(err_msg, self.allocator);
 
         log.err("Server protocol error: {} - {s}", .{ protocol_err, err_msg });
+
+        // Record an auth verdict the moment the server states it — a mid-session
+        // expiry/revocation arrives here on the live socket, not through the reconnect
+        // handshake, so a caller that later sees the closed connection can still name
+        // the cause (§10cj: JWT expired → re-enroll, not a bare "ConnectionClosed").
+        if (isAuthError(protocol_err)) self.final_auth_error = protocol_err;
 
         // Handle handshake failure
         if (self.handshake_state.isWaiting()) {

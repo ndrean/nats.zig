@@ -240,6 +240,36 @@ test "jwt credentials file authentication" {
     try conn.flush();
 }
 
+test "jwt credentials content authentication" {
+    const io = std.testing.io;
+
+    // The same fixture, handed over as bytes: an app that holds its creds in memory.
+    const content = try std.Io.Dir.cwd().readFileAlloc(io, test_creds_path, std.testing.allocator, .limited(1024 * 1024));
+    defer std.testing.allocator.free(content);
+
+    const opts = nats.ConnectionOptions{
+        .user_creds_content = content,
+    };
+
+    const conn = try utils.createConnection(io, .jwt_auth, opts);
+    defer utils.closeConnection(conn);
+
+    try conn.publish("test.auth.jwt.content", "jwt content authenticated");
+    try conn.flush();
+}
+
+test "malformed credentials content fails before connecting" {
+    const io = std.testing.io;
+
+    const opts = nats.ConnectionOptions{
+        .user_creds_content = "not a creds file",
+    };
+
+    // Even the unused port works here: the content is parsed before dialing.
+    const result = utils.createConnection(io, .unknown, opts);
+    try std.testing.expect(std.meta.isError(result));
+}
+
 test "jwt inline with nkey seed authentication" {
     const io = std.testing.io;
 

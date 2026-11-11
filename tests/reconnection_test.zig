@@ -364,3 +364,100 @@ test "initial connect iterates the server pool" {
     try nc.publish("test.pool.failover", "made it");
     try nc.flush();
 }
+
+test "a long pull request parked before a cluster crash is asked again after the reconnect" {
+    const io = std.testing.io;
+    const PullSubscription = nats.PullSubscription;
+
+    tracker.reset();
+    const nc = try utils.createConnection(io, .node1, .{
+        .reconnect = .{ .allow_reconnect = true },
+        .callbacks = .{
+            .disconnected_cb = CallbackTracker.disconnectedCallback,
+            .reconnected_cb = CallbackTracker.reconnectedCallback,
+            .closed_cb = CallbackTracker.closedCallback,
+            .error_cb = CallbackTracker.errorCallback,
+        },
+    });
+    defer utils.closeConnection(nc);
+    var js = nc.jetstream(.{});
+
+    var info = try js.addStream(.{ .name = "TEST_PARKED_RECONNECT", .subjects = &[_][]const u8{"test.parked.*"}, .storage = .file, .num_replicas = 3 });
+    info.deinit();
+    defer js.deleteStream("TEST_PARKED_RECONNECT") catch {};
+
+    const shared = try js.pullInbox();
+    defer shared.deinit();
+    shared.request_expires_ms = 30_000; // far longer than the test waits below
+    var sub = try js.pullSubscribe("test.parked.*", "parked", .{ .stream = "TEST_PARKED_RECONNECT", .inbox = shared });
+    defer sub.deinit();
+    const subs = [_]*PullSubscription{sub};
+
+    // One request parked on the server for 30 s.
+    {
+        var mb = try shared.fetch(&subs, 100, utils.ioTimeout(.fromMilliseconds(200)));
+        mb.deinit();
+    }
+    const epoch_before = nc.reconnect_epoch.load(.acquire);
+
+    // The whole cluster dies without a word (SIGKILL: no status frame to the parked request,
+    // as when a server crashes or a phone's network vanishes) and comes back: it forgot
+    // every parked request; the stream survives on disk.
+    try utils.runDockerCompose(std.testing.allocator, &.{ "kill", "nats-1", "nats-2", "nats-3" });
+    try utils.runDockerCompose(std.testing.allocator, &.{ "start", "nats-1", "nats-2", "nats-3" });
+    try tracker.waitForReconnected(io, .fromSeconds(20));
+    try testing.expect(nc.reconnect_epoch.load(.acquire) > epoch_before);
+
+    // JetStream answers again once the cluster has its leaders back.
+    var published = false;
+    for (0..40) |_| {
+        if (js.publish("test.parked.one", "after the restart", .{})) |res| {
+            var r = res;
+            r.deinit();
+            published = true;
+            break;
+        } else |_| {
+            try std.Io.sleep(io, .fromMilliseconds(500), .awake);
+        }
+    }
+    try testing.expect(published);
+    // And the consumer has its leader back (asked aside: an error on the fetch itself
+    // would free the request slot whatever the epoch says, and prove nothing).
+    var ready = false;
+    for (0..40) |_| {
+        if (js.getConsumerInfo("TEST_PARKED_RECONNECT", "parked")) |ci| {
+            var c = ci;
+            c.deinit();
+            ready = true;
+            break;
+        } else |_| {
+            try std.Io.sleep(io, .fromMilliseconds(500), .awake);
+        }
+    }
+    try testing.expect(ready);
+
+    // The old request is gone with the crash, though its 30 s deadline is far off: ONE
+    // short fetch must park a new one on the server. Asked of the server, not inferred
+    // from a delivery, which other routes can bring.
+    var got: usize = 0;
+    {
+        var mb = try shared.fetch(&subs, 100, utils.ioTimeout(.fromMilliseconds(200)));
+        defer mb.deinit();
+        got += mb.messages.len; // the new request may bring the message at once
+        if (mb.messages.len == 0) {
+            var ci = try js.getConsumerInfo("TEST_PARKED_RECONNECT", "parked");
+            defer ci.deinit();
+            std.debug.print("after the crash and one fetch: {d} request(s) waiting on the server\n", .{ci.value.num_waiting});
+            try testing.expect(ci.value.num_waiting >= 1);
+        }
+    }
+    // And the stored message comes through it.
+    for (0..10) |_| {
+        if (got > 0) break;
+        var mb = try shared.fetch(&subs, 100, utils.ioTimeout(.fromMilliseconds(500)));
+        defer mb.deinit();
+        got += mb.messages.len;
+        if (got > 0) break;
+    }
+    try testing.expectEqual(@as(usize, 1), got);
+}

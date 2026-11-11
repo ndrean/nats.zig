@@ -21,6 +21,22 @@ const STATUS_CONTROL = message_mod.STATUS_CONTROL;
 const STATUS_NOT_FOUND = message_mod.STATUS_NOT_FOUND;
 const STATUS_TIMEOUT = message_mod.STATUS_TIMEOUT;
 const STATUS_MAX_BYTES = message_mod.STATUS_MAX_BYTES;
+const STATUS_NO_RESPONSE = message_mod.STATUS_NO_RESPONSE;
+const STATUS_CONFLICT: u16 = 409;
+
+/// A status frame saying the consumer behind a pull no longer exists. Two shapes: a NEW
+/// pull request to a missing consumer answers 503 "No Responders"; a pull request already
+/// OPEN when the consumer is deleted answers 409 "Consumer Deleted" (the Go client's
+/// `ErrConsumerDeleted`). Since a fetch keeps requests open across calls (patches 22–24),
+/// the second is the usual one: counted as an expiry, it hid a gone consumer until the
+/// next new request (NATS_ZIG_NOTES §33).
+fn consumerGone(msg: *Message) bool {
+    if (msg.status_code == STATUS_NO_RESPONSE) return true;
+    if (msg.status_code != STATUS_CONFLICT) return false;
+    const description = msg.headerGet("Description") orelse return false;
+    return std.ascii.startsWithIgnoreCase(description, "Consumer Deleted");
+}
+
 const Connection = @import("connection.zig").Connection;
 const Subscription = @import("subscription.zig").Subscription;
 const subscription_mod = @import("subscription.zig");
@@ -114,6 +130,9 @@ pub const StreamConfig = struct {
     no_ack: bool = false,
     /// When a Stream reaches its limits either old messages are deleted or new ones are denied
     discard: enum { old, new } = .old,
+    /// With `discard = .new` and `max_msgs_per_subject`, refuse a new message on a subject
+    /// that is full instead of on the whole stream (requires NATS 2.10+)
+    discard_new_per_subject: ?bool = null,
     /// The time window to track duplicate messages for, in nanoseconds. 0 for default
     duplicate_window: u64 = 0,
     /// Allow direct get on any replica instead of just the leader
@@ -234,6 +253,12 @@ pub const ConsumerConfig = struct {
     deliver_group: ?[]const u8 = null,
     /// Enable flow control protocol for push consumers
     flow_control: ?bool = null,
+    /// LOCAL FIX (see NOTES.md): nanoseconds of inactivity after which the SERVER
+    /// deletes the consumer. Honoured for durable consumers too on nats-server >= 2.9,
+    /// which is what makes a named consumer reapable from a client whose grants
+    /// exclude `$JS.API.CONSUMER.DELETE`. Null (the default) keeps upstream behaviour:
+    /// the consumer persists until deleted.
+    inactive_threshold: ?u64 = null,
 };
 
 pub const ConsumerInfo = struct {
@@ -409,6 +434,12 @@ pub const MessageBatch = struct {
     /// Array of JetStream messages
     messages: []*JetStreamMessage,
     /// Any error that occurred during fetch
+    /// ⚠️ DEAD since 2026-08-29 — always `null`. Terminal statuses (408 expiry, 404
+    /// no-messages, 503 no-responders) are now RETURNED by `fetch` when the batch is
+    /// empty, and a partial batch is a success (nats.go's legacy `Fetch` contract).
+    /// The field is kept so existing callers still compile; it carries nothing, and
+    /// reading it is a mistake the old contract invited (see `fetch`). Remove it in the
+    /// next breaking release.
     err: ?anyerror = null,
 
     pub fn deinit(self: *MessageBatch) void {
@@ -422,7 +453,69 @@ pub const MessageBatch = struct {
 };
 
 /// JetStream pull subscription
+/// How long `fetch` keeps collecting after its first message (see `fetch`). 1 ms: a
+/// batch already in flight arrives back-to-back on the socket, so this collects it;
+/// anything longer is pure latency on a single event — measured end to end in
+/// ZeBridge's libzb, 10 ms here made a 13 ms row, 1 ms makes it 3 ms.
+const fetch_idle_after_first: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } };
+
+/// How long a pull request stays open after its last delivered message (see
+/// `requestDelivered`): the server may still be sending what it queued before `expires`.
+const request_grace: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(2000), .clock = .awake } };
+
+/// One outstanding pull request of a `PullSubscription` (see `reqs`).
+/// Patch 26: how many "Message Size Exceeds MaxBytes" ends one fetch answers with a new
+/// request while it holds no message. A routine end is followed by messages at once; three
+/// in a row with nothing mean the next message is larger than `max_bytes` itself.
+const max_bytes_empty_ends: u8 = 3;
+
+const PullRequest = struct {
+    reply: [160]u8 = undefined,
+    reply_len: usize = 0,
+    /// Messages the request still owes (the server serves a consumer's requests oldest first).
+    left: usize = 0,
+    deadline: Io.Timeout = .none,
+    order: u64 = 0,
+    /// `Connection.reconnect_epoch` when the request was sent: a reconnect since means
+    /// the server dropped it, whatever its deadline says (see `slotOpen`).
+    epoch: u32 = 0,
+};
+
 pub const PullSubscription = struct {
+    /// How long `fetch` keeps collecting after its first message — `fetch_idle_after_first`
+    /// (1 ms) unless the owner says otherwise. A CDC tail wants the 1 ms: one event, at
+    /// once. An OBJECT reader wants the opposite: its `batch` chunks are contiguous and
+    /// always all coming, and returning after the first one over a link where they do not
+    /// land within a millisecond (any real network) makes the caller ask for the next
+    /// batch while the rest of this one is still in flight — measured from an iPhone on
+    /// Wi-Fi: 59 requests in a few seconds, 513 chunks delivered, 42 MB pending on the
+    /// server, `Slow Consumer (Pending Bytes)`, connection cut. Set it to the fetch
+    /// timeout and a fetch returns with the batch, or the deadline.
+    idle_after_first: Io.Timeout = fetch_idle_after_first,
+    /// The most bytes one pull request may ask the server for (null: the server's own
+    /// limit). The server queues a request's messages for this connection at once, and
+    /// over a slow link overlapping requests exceed its per-connection `max_pending`
+    /// (64 MB): it then CLOSES the connection and every delivery in flight is lost
+    /// (measured: an iPhone on Wi-Fi, 100 × 250 KB messages per request, disconnected 66
+    /// times as a slow consumer). A cap keeps the queue bounded.
+    max_bytes: ?u64 = null,
+    /// The ONE pull request this consumer has outstanding: its reply subject (length 0:
+    /// none), the messages it still owes, and when the server expires it. A fetch that
+    /// returns early (after its first message, `idle_after_first`) leaves the rest of its
+    /// request in flight; asking again then — which every fetch did — stacked request on
+    /// request, each queued in full by the server for this connection. Over Wi-Fi an
+    /// iPhone polling once a second held a dozen 8 MB requests at once, passed the
+    /// server's 64 MB per-connection queue and was disconnected as a slow consumer every
+    /// few seconds, losing every delivery in flight (ZeBridge §10jc). One outstanding
+    /// request bounds the bytes in flight by `max_bytes`, whatever the link.
+    reqs: [2]PullRequest = .{ .{}, .{} },
+    req_order: u64 = 0,
+    /// How many requests may be outstanding at once, at most 2. 1: the caller's apply
+    /// and the next transfer alternate. 2: the next request downloads while the caller
+    /// applies the last batch — on an iPhone over Wi-Fi a catch-up whose transfer and
+    /// apply each take ~1.5 s per 8 MB goes about twice as fast. Bytes in flight stay
+    /// bounded by `pull_depth × max_bytes`.
+    pull_depth: usize = 1,
     /// JetStream context
     js: JetStream,
     /// Consumer information
@@ -435,47 +528,178 @@ pub const PullSubscription = struct {
     fetch_id_counter: u64 = 0,
     /// Mutex for fiber safety
     mutex: xsync.Mutex = .init,
+    /// False when `inbox_subscription`/`inbox_prefix` belong to a shared `PullInbox`.
+    owns_inbox: bool = true,
 
     pub fn deinit(self: *PullSubscription) void {
         self.consumer_info.deinit();
-        self.inbox_subscription.deinit(); // This will unsubscribe and release the user reference
-        self.js.nc.allocator.free(self.inbox_prefix);
+        if (self.owns_inbox) {
+            self.inbox_subscription.deinit(); // This will unsubscribe and release the user reference
+            self.js.nc.allocator.free(self.inbox_prefix);
+        }
         self.js.nc.allocator.destroy(self);
     }
 
+    /// The pull API subject for this consumer, allocated from `a`.
+    fn nextSubject(self: *PullSubscription, a: std.mem.Allocator) ![]u8 {
+        return self.js.apiSubject(a, "CONSUMER.MSG.NEXT.{s}.{s}", .{ self.consumer_info.value.stream_name, self.consumer_info.value.name });
+    }
+
     /// Fetch a batch of messages from the pull consumer
+    /// A data message the server has ALREADY delivered to this consumer's inbox — the
+    /// reply to a pull request still parked at the server after `fetch` returned early —
+    /// without issuing a new request. Status frames are skipped; null at the deadline.
+    ///
+    /// What a clean stop needs: after the last `fetch`, its request stays parked for up
+    /// to its `expires`, and messages delivered into that window reach a subscription
+    /// nobody reads — in flight until their ack wait runs out. Reading the inbox for that
+    /// window, then leaving, is the difference between a restart that replays and one
+    /// that does not (ZeBridge NOTES §10ec).
+    pub fn nextDelivered(self: *PullSubscription, timeout: Io.Timeout) !?*JetStreamMessage {
+        if (!self.owns_inbox) return error.SharedInbox;
+        try self.mutex.lock(self.js.nc.io);
+        defer self.mutex.unlock(self.js.nc.io);
+        const deadline = timeout.toDeadline(self.js.nc.io);
+        while (true) {
+            const raw = self.inbox_subscription.nextMsgTimeout(deadline) catch |err| switch (err) {
+                error.Timeout => return null,
+                else => return err,
+            };
+            if (raw.status_code > 0) {
+                raw.deinit();
+                continue;
+            }
+            return try jetstream_message.createJetStreamMessage(self.js.nc, raw);
+        }
+    }
+
+    /// A request still owes messages and has not expired (an expired one is forgotten).
+    fn slotOpen(self: *PullSubscription, r: *PullRequest) bool {
+        if (r.reply_len == 0 or r.left == 0) return false;
+        // Sent before a reconnect: the server forgot it, so it will never deliver or
+        // expire. Holding the slot would leave the consumer without a request until the
+        // deadline — with a long `PullInbox.request_expires_ms`, live changes would wait.
+        if (r.epoch != self.js.nc.reconnect_epoch.load(.acquire)) {
+            r.reply_len = 0;
+            return false;
+        }
+        const d = r.deadline.toDurationFromNow(self.js.nc.io) orelse {
+            r.reply_len = 0;
+            return false;
+        };
+        if (d.raw.toNanoseconds() <= 0) {
+            r.reply_len = 0;
+            return false;
+        }
+        return true;
+    }
+
+    /// Fewer requests outstanding than `pull_depth` allows.
+    fn wantsRequest(self: *PullSubscription) bool {
+        var n: usize = 0;
+        for (&self.reqs) |*r| {
+            if (self.slotOpen(r)) n += 1;
+        }
+        return n < @min(@max(self.pull_depth, 1), self.reqs.len);
+    }
+
+    fn requestStart(self: *PullSubscription, reply: []const u8, batch: usize, deadline: Io.Timeout) void {
+        for (&self.reqs) |*r| {
+            if (self.slotOpen(r)) continue;
+            const n = @min(reply.len, r.reply.len);
+            @memcpy(r.reply[0..n], reply[0..n]);
+            r.reply_len = n;
+            r.left = batch;
+            r.deadline = deadline;
+            r.epoch = self.js.nc.reconnect_epoch.load(.acquire);
+            self.req_order += 1;
+            r.order = self.req_order;
+            return;
+        }
+    }
+
+    /// A data message: owed by the OLDEST open request.
+    fn requestDelivered(self: *PullSubscription) void {
+        var oldest: ?*PullRequest = null;
+        for (&self.reqs) |*r| {
+            if (r.reply_len == 0 or r.left == 0) continue;
+            if (oldest == null or r.order < oldest.?.order) oldest = r;
+        }
+        if (oldest) |o| {
+            o.left -= 1;
+            if (o.left == 0) {
+                o.reply_len = 0;
+            } else {
+                // Still arriving: the request is not over while its messages are on the
+                // wire, whatever its `expires` said. The server queues a request's messages
+                // at once; over a link slower than that (an 8 MB request at ~5 MB/s takes
+                // 1.6 s, its `expires` was 0.9 s) the slot used to free while data was still
+                // in flight, the next fetch asked again, and the bytes in flight grew past
+                // `pull_depth × max_bytes` — one more slow-consumer disconnect on the phone.
+                // Each delivery keeps the request open for `request_grace` more.
+                const grace = request_grace.toDeadline(self.js.nc.io);
+                const cur = o.deadline.toDurationFromNow(self.js.nc.io);
+                const ext = grace.toDurationFromNow(self.js.nc.io);
+                if (cur == null or (ext != null and ext.?.raw.toNanoseconds() > cur.?.raw.toNanoseconds())) o.deadline = grace;
+            }
+        }
+    }
+
+    fn hasReply(self: *const PullSubscription, subject: []const u8) bool {
+        for (&self.reqs) |*r| {
+            if (r.reply_len > 0 and std.mem.eql(u8, r.reply[0..r.reply_len], subject)) return true;
+        }
+        return false;
+    }
+
+    /// A terminal status for the request answering on `subject`.
+    fn requestEndReply(self: *PullSubscription, subject: []const u8) void {
+        for (&self.reqs) |*r| {
+            if (r.reply_len > 0 and std.mem.eql(u8, r.reply[0..r.reply_len], subject)) {
+                r.reply_len = 0;
+                r.left = 0;
+                return;
+            }
+        }
+    }
+
+    /// Sends pull requests while a slot is open (`pull_depth`, patch 23) — at the start of a
+    /// fetch, and again inside it when a request ended with room for another (patch 26).
+    fn sendRequests(self: *PullSubscription, batch: usize, timeout: Io.Timeout) !void {
+        while (self.wantsRequest()) {
+            self.fetch_id_counter += 1;
+            const new_reply = try std.fmt.allocPrint(self.js.nc.allocator, "{s}{d}", .{ self.inbox_prefix, self.fetch_id_counter });
+            defer self.js.nc.allocator.free(new_reply);
+            const timeout_duration = timeout.toDurationFromNow(self.js.nc.io);
+            const request = FetchRequest{
+                .batch = batch,
+                .max_bytes = self.max_bytes,
+                .expires = if (timeout_duration) |duration| @intCast(duration.raw.toNanoseconds()) else null,
+            };
+            const request_json = try jsonStringifyAlloc(self.js.nc.allocator, request, .{
+                .emit_null_optional_fields = false,
+            });
+            defer self.js.nc.allocator.free(request_json);
+            const api_subject = try self.js.apiSubject(self.js.nc.allocator, "CONSUMER.MSG.NEXT.{s}.{s}", .{ self.consumer_info.value.stream_name, self.consumer_info.value.name });
+            defer self.js.nc.allocator.free(api_subject);
+            try self.js.nc.publishRequest(api_subject, new_reply, request_json);
+            self.requestStart(new_reply, batch, timeout.toDeadline(self.js.nc.io));
+        }
+    }
+
     pub fn fetch(self: *PullSubscription, batch: usize, timeout: Io.Timeout) !MessageBatch {
         if (batch == 0) return error.InvalidBatchSize;
+        // A shared inbox is read by `PullInbox.fetch` only: reading it here would
+        // consume the other consumers' replies.
+        if (!self.owns_inbox) return error.SharedInbox;
 
         try self.mutex.lock(self.js.nc.io);
         defer self.mutex.unlock(self.js.nc.io);
 
-        // Generate unique fetch ID and reply subject
-        self.fetch_id_counter += 1;
-        const fetch_id = self.fetch_id_counter;
-
-        const reply_subject = try std.fmt.allocPrint(self.js.nc.allocator, "{s}{d}", .{ self.inbox_prefix, fetch_id });
-        defer self.js.nc.allocator.free(reply_subject);
-
-        const timeout_duration = timeout.toDurationFromNow(self.js.nc.io);
-        const request = FetchRequest{
-            .batch = batch,
-            .expires = if (timeout_duration) |duration| @intCast(duration.raw.toNanoseconds()) else null,
-        };
-
-        // Serialize the fetch request to JSON
-        const request_json = try jsonStringifyAlloc(self.js.nc.allocator, request, .{
-            .emit_null_optional_fields = false,
-        });
-        defer self.js.nc.allocator.free(request_json);
-
-        // Build the full API subject
-        const api_subject = try std.fmt.allocPrint(self.js.nc.allocator, "{s}CONSUMER.MSG.NEXT.{s}.{s}", .{ default_api_prefix, self.consumer_info.value.stream_name, self.consumer_info.value.name });
-        defer self.js.nc.allocator.free(api_subject);
-
-        // Send the pull request with reply subject
-        try self.js.nc.publishRequest(api_subject, reply_subject, request_json);
-
+        // At most `pull_depth` requests outstanding (see `reqs`): a new one only while
+        // fewer are open — delivered in full, ended with a status, or expired. The inbox
+        // holds only what the open ones already sent, which this fetch collects first.
+        try self.sendRequests(batch, timeout);
         // Collect messages
         var messages = std.ArrayList(*JetStreamMessage).empty;
         defer messages.deinit(self.js.nc.allocator);
@@ -483,28 +707,70 @@ pub const PullSubscription = struct {
 
         var batch_complete = false;
         var fetch_error: ?anyerror = null;
+        // Patch 26: max-bytes ends met with nothing in hand, in a row (see the 409 branch).
+        var empty_ends: u8 = 0;
 
         // Convert the timeout to an absolute deadline so that receiving a
         // message (or a heartbeat) does not re-arm the full timeout.
-        const receive_deadline = timeout.toDeadline(self.js.nc.io);
+        //
+        // ⚠️ Once the FIRST message has arrived the deadline shrinks to a short idle
+        // window (`fetch_idle_after_first`): a fetch returns as soon as it has
+        // something and the in-flight remainder has been collected, instead of
+        // parking until `timeout` in the hope of filling the batch. This is nats.go's
+        // legacy `Fetch` contract, and the difference between a caller seeing a row at
+        // once and seeing it when the expiry fires (measured in libzb: one queued
+        // message, a 3 s fetch for 100, returned at 3006 ms). The server keeps the
+        // pull request parked until its own `expires`; its late 408 is attributed to
+        // this reply subject and dropped by the guard below on a later fetch.
+        var receive_deadline = timeout.toDeadline(self.js.nc.io);
 
-        // Collect messages until batch is complete or timeout
-        while (!batch_complete and messages.items.len < request.batch) {
+        // Collect messages until batch is complete or timeout — the caller's batch, which
+        // the queue's share and the request's share make up together.
+        while (!batch_complete and messages.items.len < batch) {
             if (self.inbox_subscription.nextMsgTimeout(receive_deadline)) |raw_msg| {
                 log.debug("Message: subject={s}, reply={s}, data='{s}'", .{ raw_msg.subject, raw_msg.reply orelse "none", raw_msg.data });
 
-                // Status messages are addressed to the reply subject of the
-                // request they answer. One for an earlier fetch that gave up
-                // locally says nothing about this one. Data messages from
-                // earlier requests are still the consumer's, so they are kept.
-                if (raw_msg.status_code > 0 and !std.mem.eql(u8, raw_msg.subject, reply_subject)) {
+                // ⚠️ `inbox_subscription` is a WILDCARD (`<prefix>.*`), so it also receives
+                // replies addressed to *earlier* fetches. A fetch that returns before its
+                // `expires` leaves its request parked on the server until the server times
+                // it out, and that late 408 then lands here while a newer fetch is waiting.
+                //
+                // Accepting it ends the new fetch early, the caller re-fetches at once, and
+                // that leaves another parked request behind — self-sustaining, settling at
+                // `expires / period` parked pulls. Measured against an idle stream: 500 ms
+                // expiry, a new fetch every 48 ms, num_waiting=10, ~21 pull requests/sec
+                // with nothing to deliver.
+                //
+                // ⚠️ Applies to STATUS frames only. JetStream delivers a *data* message
+                // with its original subject (`test.foo`), routed to us by subscription id,
+                // so matching those against the inbox would drop every real message — the
+                // e2e suite catches exactly that. Status frames are addressed to the inbox
+                // (`HMSG _INBOX.<prefix>.<fetch_id>`), so they can be attributed, and they
+                // are the only ones this loop treats as terminal.
+                if (raw_msg.status_code > 0 and !self.hasReply(raw_msg.subject)) {
                     raw_msg.deinit();
                     continue;
                 }
 
+                if (raw_msg.status_code > 0 and raw_msg.status_code != STATUS_CONTROL) self.requestEndReply(raw_msg.subject);
                 if (raw_msg.status_code == STATUS_NOT_FOUND) {
-                    // No messages available
+                    // No messages available (404, a no_wait pull): "nothing before the
+                    // deadline", the same answer as an expiry.
                     raw_msg.deinit();
+                    if (messages.items.len == 0) fetch_error = error.Timeout;
+                    batch_complete = true;
+                    break;
+                } else if (consumerGone(raw_msg)) {
+                    // ⚠️ 503 "No Responders" (or 409 "Consumer Deleted" on a request that
+                    // was already open, see consumerGone): nothing serves this consumer's pull subject —
+                    // the consumer was deleted, reaped by its inactive threshold, or never
+                    // created. Folding it into the unknown-status branch (as before) made
+                    // a gone consumer look exactly like an idle one: the caller waited out
+                    // the whole timeout and got `error.Timeout`. Verified against
+                    // nats-server 2.14.5: `$JS.API.CONSUMER.MSG.NEXT.<stream>.<missing>`
+                    // answers a bare 503.
+                    raw_msg.deinit();
+                    if (messages.items.len == 0) fetch_error = error.NoResponders;
                     batch_complete = true;
                     break;
                 } else if (raw_msg.status_code == STATUS_TIMEOUT) {
@@ -516,8 +782,38 @@ pub const PullSubscription = struct {
                     batch_complete = true;
                     break;
                 } else if (raw_msg.status_code == STATUS_MAX_BYTES) {
-                    // Consumer sequence mismatch
+                    // ⚠️ 409 means several things; its Description says which. "Message
+                    // Size Exceeds MaxBytes" is the ROUTINE end of one request that carries
+                    // `max_bytes` (patch 21): the next message did not fit what the request
+                    // had left. At a 2 MB cap and 256 KB CDC batches that is every few
+                    // messages. Reported as an error it ended the caller's fetch with
+                    // `ConsumerSequenceMismatch` whenever it arrived before any message —
+                    // and a CLI follower exited on it (ZeBridge NOTES §10je). Now: with
+                    // messages in hand the batch is complete, as for the expiry; with none,
+                    // a replacement request goes out at once and the fetch keeps waiting.
+                    // A message larger than `max_bytes` itself ends EVERY request this way
+                    // with nothing delivered; re-asking would loop until the deadline. So a
+                    // fetch re-asks at most `max_bytes_empty_ends` times in a row with
+                    // nothing in hand, then reports it. (Telling the two apart per request
+                    // does not work: which request a message answers is the server's
+                    // business, and the client's oldest-first guess measured wrong.) Every
+                    // other 409 (Consumer Deleted, Exceeded MaxWaiting, …) stays an error.
+                    const routine = if (raw_msg.headerGet("Description")) |d|
+                        std.mem.eql(u8, std.mem.trim(u8, d, " \t"), "Message Size Exceeds MaxBytes")
+                    else
+                        false;
                     raw_msg.deinit();
+                    if (routine) {
+                        if (messages.items.len > 0) {
+                            batch_complete = true;
+                            break;
+                        }
+                        if (empty_ends < max_bytes_empty_ends) {
+                            empty_ends += 1;
+                            try self.sendRequests(batch, timeout);
+                            continue;
+                        }
+                    }
                     fetch_error = error.ConsumerSequenceMismatch;
                     batch_complete = true;
                     break;
@@ -537,10 +833,17 @@ pub const PullSubscription = struct {
                     errdefer js_msg_ptr.deinit();
 
                     try messages.append(self.js.nc.allocator, js_msg_ptr);
+                    self.requestDelivered();
+                    // Something arrived: from here on wait only for what is already in flight.
+                    if (messages.items.len == 1) {
+                        receive_deadline = self.idle_after_first.toDeadline(self.js.nc.io);
+                    }
                 }
             } else |err| switch (err) {
                 error.Timeout => {
-                    // Timeout occurred
+                    // The CLIENT-side deadline — it fires before the server's 408 when
+                    // the two are equal, so this is the usual way an idle fetch ends.
+                    if (messages.items.len == 0) fetch_error = error.Timeout;
                     batch_complete = true;
                 },
                 error.Canceled, error.ConnectionClosed, error.SlowConsumer => {
@@ -553,13 +856,203 @@ pub const PullSubscription = struct {
             }
         }
 
+        // ⚠️ nats.go's legacy `Fetch` contract, which fits a SYNCHRONOUS call: an empty
+        // batch with a terminal status is an ERROR (`Timeout` for the 408 expiry,
+        // `NoResponders` for the 503), and a partial batch is a success with `err`
+        // null — the caller got messages, there is nothing to report. Parking the error
+        // on the batch (the async `jetstream.MessageBatch` shape) let a caller `try` the
+        // fetch and never look at `err`; every `catch error.Timeout` written against the
+        // old behaviour was dead code.
+        if (messages.items.len == 0) {
+            if (fetch_error) |err| return err;
+        }
+
         // Convert ArrayList to owned slice
         const messages_slice = try messages.toOwnedSlice(self.js.nc.allocator);
 
         return MessageBatch{
             .messages = messages_slice,
-            .err = fetch_error,
+            .err = null,
             .allocator = self.js.nc.allocator,
+        };
+    }
+};
+
+/// What `PullInbox.fetch` returns: messages from ANY of the consumers asked (each
+/// says which via `metadata.stream` / `metadata.consumer`), and per consumer whether
+/// nobody served it (`gone[i]`: a 503 — deleted, reaped, never created). A partial
+/// failure is the normal case here, which is why it is a field and not an error: one
+/// consumer of ten going away must not hide the nine that answered.
+pub const MultiBatch = struct {
+    allocator: std.mem.Allocator,
+    messages: []*JetStreamMessage,
+    /// Indexed like the `subs` slice given to `fetch`.
+    gone: []bool,
+
+    pub fn deinit(self: *MultiBatch) void {
+        for (self.messages) |m| m.deinit();
+        self.allocator.free(self.messages);
+        self.allocator.free(self.gone);
+    }
+};
+
+/// One inbox, several pull consumers, ONE wait.
+///
+/// A `PullSubscription` owns a private wildcard inbox, so a client tailing N streams
+/// can block on one consumer at a time and must alternate between them in slices —
+/// measured in ZeBridge's libzb: two streams, 250 ms slices, a busy stream waits out
+/// the idle one's slice. With a shared inbox every consumer answers into the same
+/// subscription; `fetch` issues one pull per consumer and then waits on the single
+/// queue, so the first message from ANY of them ends the wait.
+///
+/// Attribution is what makes this safe: a status frame (404/408/503) is addressed to
+/// the reply subject of the pull it answers, and a data message carries its stream
+/// and consumer in its ack subject (`metadata`). Replies to an EARLIER fetch — a
+/// parked pull that expired after we returned, or its late messages — are therefore
+/// either dropped (stale status) or delivered to the right consumer anyway (data).
+///
+/// Create with `JetStream.pullInbox`; pass to `pullSubscribe` as `.inbox`. Not
+/// fiber-safe across concurrent `fetch` calls (one waiter per inbox, by design).
+pub const PullInbox = struct {
+    js: JetStream,
+    inbox_subscription: *Subscription,
+    inbox_prefix: []u8,
+    fetch_id_counter: u64 = 0,
+    mutex: xsync.Mutex = .init,
+    /// As `PullSubscription.max_bytes`, for every consumer's request on this inbox.
+    max_bytes: ?u64 = null,
+    /// How long the server keeps each pull request waiting for messages, independent of
+    /// how long one `fetch` waits locally (null: the fetch's own timeout, as before). A
+    /// caller that fetches often with a short timeout otherwise sends a new request per
+    /// consumer each time, whether or not anything arrived: ZeBridge clients polling every
+    /// 250 ms sent ~6.5 pull requests a second per idle stream, about 13 a second per
+    /// connected device. With a long expiry the request stays parked, delivers each
+    /// message as it is stored, and the next fetch finds it in the inbox; a new request
+    /// goes out only when one is filled or expires (`wantsRequest`), or after a reconnect.
+    request_expires_ms: ?u32 = null,
+
+    pub fn deinit(self: *PullInbox) void {
+        self.inbox_subscription.deinit();
+        self.js.nc.allocator.free(self.inbox_prefix);
+        self.js.nc.allocator.destroy(self);
+    }
+
+    /// Pull up to `batch` messages from EACH of `subs` (all on this inbox), waiting
+    /// at most `timeout` for the first message from any of them, then a short idle
+    /// window for what is in flight. Returns `error.NoResponders` only when EVERY
+    /// consumer answered 503; otherwise a `MultiBatch`, possibly with no messages
+    /// (the expiry), whose `gone` says which consumers need re-creating.
+    pub fn fetch(self: *PullInbox, subs: []const *PullSubscription, batch: usize, timeout: Io.Timeout) !MultiBatch {
+        if (batch == 0) return error.InvalidBatchSize;
+        if (subs.len == 0) return error.NoSubscriptions;
+        const a = self.js.nc.allocator;
+
+        try self.mutex.lock(self.js.nc.io);
+        defer self.mutex.unlock(self.js.nc.io);
+
+        self.fetch_id_counter += 1;
+        const fetch_id = self.fetch_id_counter;
+
+        // At most `pull_depth` requests outstanding per consumer (see
+        // `PullSubscription.reqs`); a new request only while fewer are open. Reply subjects
+        // `<prefix><fetch>x<i>y<k>` — one token, as the wildcard requires — so a status
+        // frame names the request (and so the consumer) it answers.
+        const cap = batch * subs.len;
+        // The request's own lifetime on the server: the inbox's `request_expires_ms`, else
+        // this fetch's timeout.
+        const request_timeout: Io.Timeout = if (self.request_expires_ms) |ms|
+            .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } }
+        else
+            timeout;
+        const request_duration = request_timeout.toDurationFromNow(self.js.nc.io);
+        for (subs, 0..) |sub, i| {
+            if (sub.inbox_subscription != self.inbox_subscription) return error.NotOnThisInbox;
+            var k: usize = 0;
+            while (sub.wantsRequest()) : (k += 1) {
+                const new_reply = try std.fmt.allocPrint(a, "{s}{d}x{d}y{d}", .{ self.inbox_prefix, fetch_id, i, k });
+                defer a.free(new_reply);
+                const request_json = try jsonStringifyAlloc(a, FetchRequest{
+                    .batch = batch,
+                    .max_bytes = self.max_bytes,
+                    .expires = if (request_duration) |d| @intCast(d.raw.toNanoseconds()) else null,
+                }, .{ .emit_null_optional_fields = false });
+                defer a.free(request_json);
+                const api_subject = try sub.nextSubject(a);
+                defer a.free(api_subject);
+                try self.js.nc.publishRequest(api_subject, new_reply, request_json);
+                sub.requestStart(new_reply, batch, request_timeout.toDeadline(self.js.nc.io));
+            }
+        }
+
+        const gone = try a.alloc(bool, subs.len);
+        errdefer a.free(gone);
+        @memset(gone, false);
+        const done = try a.alloc(bool, subs.len);
+        defer a.free(done);
+        @memset(done, false);
+        var open: usize = subs.len;
+
+        var messages = std.ArrayList(*JetStreamMessage).empty;
+        defer messages.deinit(a);
+        errdefer for (messages.items) |m| m.deinit();
+
+        var receive_deadline = timeout.toDeadline(self.js.nc.io);
+
+        while (open > 0 and messages.items.len < cap) {
+            const raw_msg = self.inbox_subscription.nextMsgTimeout(receive_deadline) catch |err| switch (err) {
+                error.Timeout => break,
+                error.Canceled, error.ConnectionClosed, error.SlowConsumer => return err,
+            };
+            if (raw_msg.status_code > 0) {
+                // Which request does this frame answer? One no longer open (an earlier,
+                // finished one) is dropped.
+                const idx: ?usize = for (subs, 0..) |sub, i| {
+                    if (sub.hasReply(raw_msg.subject)) break i;
+                } else null;
+                const code = raw_msg.status_code;
+                const is_gone = consumerGone(raw_msg); // read before the frame is freed
+                if (idx) |hit| if (code != STATUS_CONTROL) subs[hit].requestEndReply(raw_msg.subject);
+                raw_msg.deinit();
+                const i = idx orelse continue;
+                if (code == STATUS_CONTROL) continue; // heartbeat
+                if (done[i]) continue;
+                if (is_gone) gone[i] = true;
+                // 404, 408, 409, 503 — all terminal for this consumer's pull.
+                done[i] = true;
+                open -= 1;
+                continue;
+            }
+            const js_msg = jetstream_message.createJetStreamMessage(self.js.nc, raw_msg) catch |err| {
+                raw_msg.deinit();
+                return err;
+            };
+            errdefer js_msg.deinit();
+            try messages.append(a, js_msg);
+            // Owed by whichever consumer delivered it (its ack metadata names it).
+            for (subs) |sub| if (std.mem.eql(u8, sub.consumer_info.value.name, js_msg.metadata.consumer)) {
+                sub.requestDelivered();
+                break;
+            };
+            // Something arrived: from here on wait only for what is already in flight.
+            if (messages.items.len == 1) receive_deadline = fetch_idle_after_first.toDeadline(self.js.nc.io);
+        }
+
+        if (messages.items.len == 0) {
+            var all_gone = true;
+            for (gone) |g| all_gone = all_gone and g;
+            if (all_gone) {
+                // No explicit free: the errdefer on `gone`'s allocation runs on this
+                // error return. Freeing here too was a DOUBLE FREE — and it needed every
+                // consumer on the inbox to answer terminally-gone in one fetch to fire,
+                // which is exactly what a deleted stream produces and nothing else did
+                // (found by stream_wipe.py: free() abort inside PullInbox.fetch, 2026-09-03).
+                return error.NoResponders;
+            }
+        }
+        return MultiBatch{
+            .allocator = a,
+            .messages = try messages.toOwnedSlice(a),
+            .gone = gone,
         };
     }
 };
@@ -625,11 +1118,20 @@ pub const PullSubscribeOptions = struct {
 
     /// Full consumer configuration
     config: ?ConsumerConfig = null,
+
+    /// Answer into a SHARED inbox (`JetStream.pullInbox`) instead of a private one.
+    /// The subscription is then fetched through `PullInbox.fetch` together with
+    /// every other subscription on that inbox — `PullSubscription.fetch` refuses it —
+    /// and the inbox must outlive the subscription.
+    inbox: ?*PullInbox = null,
 };
 
 pub const JetStreamOptions = struct {
     request_timeout: Io.Timeout = default_request_timeout,
-    // Add options here
+    /// The JetStream domain to address. Null speaks to the server's own JetStream at
+    /// `$JS.API.`; a name speaks to that domain at `$JS.<domain>.API.` — what a client
+    /// on a leaf node uses to reach the hub's JetStream (nats.go's `nats.Domain`).
+    domain: ?[]const u8 = null,
 };
 
 pub const JetStream = struct {
@@ -643,8 +1145,16 @@ pub const JetStream = struct {
         };
     }
 
+    /// An API subject under this context's prefix: `$JS.API.<tail>`, or
+    /// `$JS.<domain>.API.<tail>` when a domain is set. Every request the context
+    /// sends is built here, so the domain is decided in one place.
+    pub fn apiSubject(self: JetStream, a: std.mem.Allocator, comptime tail_fmt: []const u8, args: anytype) ![]u8 {
+        if (self.opts.domain) |d| return std.fmt.allocPrint(a, "$JS.{s}.API." ++ tail_fmt, .{d} ++ args);
+        return std.fmt.allocPrint(a, default_api_prefix ++ tail_fmt, args);
+    }
+
     fn sendRequest(self: JetStream, subject: []const u8, payload: []const u8) !*Message {
-        const full_subject = try std.fmt.allocPrint(self.nc.allocator, "{s}{s}", .{ default_api_prefix, subject });
+        const full_subject = try self.apiSubject(self.nc.allocator, "{s}", .{subject});
         defer self.nc.allocator.free(full_subject);
 
         return try self.nc.request(full_subject, payload, self.opts.request_timeout);
@@ -661,7 +1171,11 @@ pub const JetStream = struct {
         }) catch return;
 
         const info = response.@"error";
-        log.err("JetStream error: code={d} err_code={d} description={s}", .{ info.code, info.err_code, info.description });
+        // The caller gets this as a TYPED error and decides whether it is an incident: a
+        // bucket that already exists on a create, a consumer not found on a
+        // look-before-create, are answers, not failures. Logging them here at error
+        // level reported every routine probe as an incident (NATS_ZIG_NOTES entry 10).
+        log.debug("JetStream error: code={d} err_code={d} description={s}", .{ info.code, info.err_code, info.description });
         log.debug("Full response: {s}", .{msg.data});
 
         // Map specific JetStream error codes to proper error types
@@ -932,13 +1446,26 @@ pub const JetStream = struct {
     /// Get existing consumer or create new one based on configuration
     fn getOrCreateConsumer(self: JetStream, stream_name: []const u8, subject: ?[]const u8, durable: ?[]const u8, base_config: ?ConsumerConfig, is_pull: bool, queue: ?[]const u8) !Result(ConsumerInfo) {
         const config = buildConsumerConfig(base_config, subject, durable, is_pull, queue);
+        const name = config.name orelse config.durable_name orelse return try self.addConsumer(stream_name, config);
 
-        if (try self.lookupConsumer(stream_name, config.name orelse config.durable_name)) |existing_info| {
+        // Create first, as "create": one request where asking CONSUMER.INFO first made two —
+        // and INFO answers a missing consumer only after the meta-leader has looked, which
+        // a fleet creating consumers by the thousand pays every time (a ZeBridge device
+        // names every consumer anew: the INFO always said "not found"). An identical
+        // consumer is a success; one with other settings is refused and left untouched,
+        // and only then is it read and checked as before.
+        if (self.createConsumerAs(stream_name, config, "create")) |created| {
+            return created;
+        } else |err| switch (err) {
+            error.ConsumerAlreadyExists => {},
+            else => return err,
+        }
+        if (try self.lookupConsumer(stream_name, name)) |existing_info| {
             errdefer existing_info.deinit();
             try checkExistingConsumer(&existing_info.value, base_config orelse .{}, is_pull, subject, queue);
             return existing_info;
         }
-
+        // Deleted between the two requests.
         return try self.addConsumer(stream_name, config);
     }
 
@@ -1130,22 +1657,39 @@ pub const JetStream = struct {
     /// Creates a new consumer with the provided configuration.
     /// Uses DURABLE endpoint only if durable_name is provided, otherwise creates ephemeral consumer.
     pub fn addConsumer(self: JetStream, stream_name: []const u8, config: ConsumerConfig) !Result(ConsumerInfo) {
+        return self.createConsumerAs(stream_name, config, null);
+    }
+
+    /// `addConsumer` with the request's `action` (server >= 2.10): null creates or updates;
+    /// "create" creates, succeeds unchanged on an identical consumer, and is refused with
+    /// `ConsumerAlreadyExists` by one with other settings, which it leaves as it is.
+    fn createConsumerAs(self: JetStream, stream_name: []const u8, config: ConsumerConfig, action: ?[]const u8) !Result(ConsumerInfo) {
         try validation.validateStreamName(stream_name);
         if (config.name) |n| try validation.validateConsumerName(n);
         if (config.durable_name) |n| try validation.validateConsumerName(n);
 
-        log.info("adding consumer", .{});
-        const subject = if (config.durable_name) |durable_name|
-            try std.fmt.allocPrint(self.nc.allocator, "CONSUMER.DURABLE.CREATE.{s}.{s}", .{ stream_name, durable_name })
-        else
-            try std.fmt.allocPrint(self.nc.allocator, "CONSUMER.CREATE.{s}", .{stream_name});
+        log.debug("adding consumer", .{});
+        // LOCAL FIX (see NOTES.md): a NAMED consumer uses the modern
+        // CONSUMER.CREATE.<stream>.<name>[.<filter>] endpoint (server >= 2.9)
+        // instead of the legacy CONSUMER.DURABLE.CREATE API. Least-privilege
+        // grant sets cover the modern form (`CONSUMER.CREATE.<stream>` and
+        // `CONSUMER.CREATE.<stream>.>`); the legacy subject is typically not
+        // granted, and an unauthorized publish surfaces as a bare Timeout.
+        const named: ?[]const u8 = config.name orelse config.durable_name;
+        const subject = if (named) |n| blk: {
+            if (config.filter_subject) |filt| {
+                break :blk try std.fmt.allocPrint(self.nc.allocator, "CONSUMER.CREATE.{s}.{s}.{s}", .{ stream_name, n, filt });
+            }
+            break :blk try std.fmt.allocPrint(self.nc.allocator, "CONSUMER.CREATE.{s}.{s}", .{ stream_name, n });
+        } else try std.fmt.allocPrint(self.nc.allocator, "CONSUMER.CREATE.{s}", .{stream_name});
         defer self.nc.allocator.free(subject);
 
         // Create request payload
         const request_payload = struct {
             stream_name: []const u8,
             config: ConsumerConfig,
-        }{ .stream_name = stream_name, .config = config };
+            action: ?[]const u8 = null,
+        }{ .stream_name = stream_name, .config = config, .action = action };
 
         const config_json = try jsonStringifyAlloc(self.nc.allocator, request_payload, .{
             .emit_null_optional_fields = false,
@@ -1314,6 +1858,34 @@ pub const JetStream = struct {
         if (options.next_by_subj) |subject| try validation.validateSubject(subject);
         log.debug("getMsgDirect: Stream name validation passed", .{});
 
+        // LOCAL FIX (see NOTES.md): a last-by-subject lookup with no other
+        // options uses the ADR-31 SUBJECT form — DIRECT.GET.<stream>.<subject>
+        // with an empty body. Identical semantics to the JSON form, but it
+        // works under least-privilege grants that scope direct gets PER KEY;
+        // ZeBridge's tenant-scoped KV/object grants deliberately cover only
+        // this form (a bucket-level grant on KV_generations would hand every
+        // tenant every manifest).
+        if (options.last_by_subj != null and options.seq == null and options.next_by_subj == null) {
+            const subj_form = try std.fmt.allocPrint(self.nc.allocator, "DIRECT.GET.{s}.{s}", .{ stream_name, options.last_by_subj.? });
+            defer self.nc.allocator.free(subj_form);
+            const resp = try self.sendRequest(subj_form, "");
+            errdefer resp.deinit();
+            if (resp.status_code == STATUS_NOT_FOUND) {
+                return error.MessageNotFound;
+            } else if (resp.status_code == STATUS_TIMEOUT) {
+                return error.BadRequest;
+            } else if (resp.status_code == 413) {
+                return error.TooManySubjects;
+            }
+            if (resp.headerGet("Nats-Subject")) |nats_subject| {
+                try resp.setSubject(nats_subject, false);
+            }
+            if (resp.headerGet("Nats-Sequence")) |nats_seq_str| {
+                resp.seq = std.fmt.parseInt(u64, nats_seq_str, 10) catch 0;
+            }
+            return resp;
+        }
+
         // Build the subject for the direct get API call
         const subject = try std.fmt.allocPrint(self.nc.allocator, "DIRECT.GET.{s}", .{stream_name});
         defer self.nc.allocator.free(subject);
@@ -1454,6 +2026,9 @@ pub const JetStream = struct {
                     log.err("Failed to wrap JetStream message: {}", .{err});
                     return;
                 };
+                // The handler may deinit it; the free waits for the auto-ack below.
+                js_msg.lifetime.store(.in_handler, .release);
+                defer js_msg.endHandler();
 
                 // Call user handler with JetStream message - handler owns cleanup responsibility
                 // Support both void and fallible handlers
@@ -1521,7 +2096,7 @@ pub const JetStream = struct {
         // Prepare consumer config, generating deliver_subject if needed
         var config = options.config orelse ConsumerConfig{};
         const generated_deliver_subject = if (config.deliver_subject == null)
-            try inbox.newInbox(self.nc.allocator)
+            try self.nc.newInbox(self.nc.allocator)
         else
             null;
         errdefer if (generated_deliver_subject) |ds| self.nc.allocator.free(ds);
@@ -1588,7 +2163,7 @@ pub const JetStream = struct {
 
         // Generate deliver_subject if not provided in the config
         const generated_deliver_subject = if (config.deliver_subject == null)
-            try inbox.newInbox(self.nc.allocator)
+            try self.nc.newInbox(self.nc.allocator)
         else
             null;
         errdefer if (generated_deliver_subject) |ds| self.nc.allocator.free(ds);
@@ -1645,7 +2220,7 @@ pub const JetStream = struct {
 
         // Generate deliver_subject if not provided in the config
         const generated_deliver_subject = if (config.deliver_subject == null)
-            try inbox.newInbox(self.nc.allocator)
+            try self.nc.newInbox(self.nc.allocator)
         else
             null;
         errdefer if (generated_deliver_subject) |ds| self.nc.allocator.free(ds);
@@ -1708,7 +2283,7 @@ pub const JetStream = struct {
 
         // Generate deliver_subject if not provided in the config
         const generated_deliver_subject = if (config.deliver_subject == null)
-            try inbox.newInbox(self.nc.allocator)
+            try self.nc.newInbox(self.nc.allocator)
         else
             null;
         errdefer if (generated_deliver_subject) |ds| self.nc.allocator.free(ds);
@@ -1746,6 +2321,21 @@ pub const JetStream = struct {
     }
 
     /// Create a pull subscription for the specified stream
+    /// One inbox for several pull consumers — see `PullInbox`.
+    pub fn pullInbox(self: JetStream) !*PullInbox {
+        const inbox_base = try self.nc.newInbox(self.nc.allocator);
+        defer self.nc.allocator.free(inbox_base);
+        const inbox_prefix = try std.fmt.allocPrint(self.nc.allocator, "{s}.", .{inbox_base});
+        errdefer self.nc.allocator.free(inbox_prefix);
+        const wildcard_subject = try std.fmt.allocPrint(self.nc.allocator, "{s}*", .{inbox_prefix});
+        defer self.nc.allocator.free(wildcard_subject);
+        const inbox_subscription = try self.nc.subscribeSync(wildcard_subject);
+        errdefer inbox_subscription.deinit();
+        const shared = try self.nc.allocator.create(PullInbox);
+        shared.* = .{ .js = self, .inbox_subscription = inbox_subscription, .inbox_prefix = inbox_prefix };
+        return shared;
+    }
+
     pub fn pullSubscribe(self: JetStream, subject: ?[]const u8, durable: []const u8, options: PullSubscribeOptions) !*PullSubscription {
         // Resolve stream name
         const stream_name = if (options.stream) |s|
@@ -1757,8 +2347,26 @@ pub const JetStream = struct {
 
         defer if (options.stream == null and subject != null) self.nc.allocator.free(stream_name);
 
+        // A shared inbox: borrow its subscription and prefix, own nothing of them.
+        if (options.inbox) |shared| {
+            var consumer_info = try self.getOrCreateConsumer(stream_name, subject, durable, options.config, true, null);
+            errdefer consumer_info.deinit();
+            // The limits only ever go up, so several consumers on one inbox get the
+            // largest of their windows.
+            applyPendingLimits(shared.inbox_subscription, &consumer_info.value.config);
+            const pull_subscription = try self.nc.allocator.create(PullSubscription);
+            pull_subscription.* = PullSubscription{
+                .js = self,
+                .consumer_info = consumer_info,
+                .inbox_subscription = shared.inbox_subscription,
+                .inbox_prefix = shared.inbox_prefix,
+                .owns_inbox = false,
+            };
+            return pull_subscription;
+        }
+
         // Generate unique inbox prefix for this pull subscription
-        const inbox_base = try inbox.newInbox(self.nc.allocator);
+        const inbox_base = try self.nc.newInbox(self.nc.allocator);
         defer self.nc.allocator.free(inbox_base);
 
         const inbox_prefix = try std.fmt.allocPrint(self.nc.allocator, "{s}.", .{inbox_base});
@@ -1893,9 +2501,29 @@ pub const JetStream = struct {
         return try manager.openBucket(bucket_name);
     }
 
+    /// `kvBucket` without the stream lookup (`KVManager.bindBucket`): for a credential
+    /// granted exact keys only.
+    pub fn kvBind(self: JetStream, bucket_name: []const u8) !@import("jetstream_kv.zig").KV {
+        var manager = self.kvManager();
+        return try manager.bindBucket(bucket_name);
+    }
+
     /// Create an object store manager
     pub fn objectStoreManager(self: JetStream) @import("jetstream_objstore.zig").ObjectStoreManager {
         const jetstream_objstore = @import("jetstream_objstore.zig");
         return jetstream_objstore.ObjectStoreManager.init(self);
     }
 };
+
+test "apiSubject: no domain is $JS.API., a domain is $JS.<domain>.API." {
+    const a = std.testing.allocator;
+    const plain = JetStream{ .nc = undefined, .opts = .{} };
+    const s1 = try plain.apiSubject(a, "CONSUMER.MSG.NEXT.{s}.{s}", .{ "CDC_kilo", "c1" });
+    defer a.free(s1);
+    try std.testing.expectEqualStrings("$JS.API.CONSUMER.MSG.NEXT.CDC_kilo.c1", s1);
+
+    const hub = JetStream{ .nc = undefined, .opts = .{ .domain = "hub" } };
+    const s2 = try hub.apiSubject(a, "{s}", .{"INFO"});
+    defer a.free(s2);
+    try std.testing.expectEqualStrings("$JS.hub.API.INFO", s2);
+}

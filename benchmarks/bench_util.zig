@@ -1,6 +1,5 @@
 const std = @import("std");
 const nats = @import("nats");
-const zio = @import("zio");
 
 // Global flag for signal handling
 pub var keep_running: bool = true;
@@ -91,21 +90,25 @@ pub fn setupSignals() !void {
 
 pub const BenchConnection = struct {
     allocator: std.mem.Allocator,
-    runtime: *zio.Runtime,
+    /// The library runs on std.Io.Threaded, as its users do; heap-allocated so the Io it
+    /// hands the connection keeps a stable address.
+    runtime: *std.Io.Threaded,
     conn: *nats.Connection,
 
     pub fn deinit(self: *BenchConnection) void {
         self.conn.deinit();
         self.allocator.destroy(self.conn);
         self.runtime.deinit();
+        self.allocator.destroy(self.runtime);
         self.allocator.destroy(self);
     }
 };
 
 // Connect to NATS server
 pub fn connect(allocator: std.mem.Allocator, url: ?[]const u8) !*BenchConnection {
-    // Create zio runtime
-    const rt = try zio.Runtime.init(allocator, .{});
+    const rt = try allocator.create(std.Io.Threaded);
+    errdefer allocator.destroy(rt);
+    rt.* = std.Io.Threaded.init(allocator, .{});
     errdefer rt.deinit();
 
     var conn = try allocator.create(nats.Connection);

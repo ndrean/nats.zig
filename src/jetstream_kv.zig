@@ -202,7 +202,7 @@ pub const KVWatcher = struct {
     pub fn init(kv: *KV, subjects: []const []const u8, options: WatchOptions) !Self {
         const allocator = kv.js.nc.allocator;
 
-        const inbox = try newInbox(allocator);
+        const inbox = try kv.js.nc.newInbox(allocator);
         defer allocator.free(inbox);
 
         const consumer_config = ConsumerConfig{
@@ -263,7 +263,7 @@ pub const KVWatcher = struct {
                 self.received += 1;
                 // Set init_pending from first message if not set
                 if (self.init_pending == 0) {
-                    self.init_pending = delta;
+                    self.init_pending = @intCast(delta); // usize on 32-bit targets; a pending count fits
                 }
                 // Check completion: received > initPending OR delta == 0 (match C logic)
                 if (self.received > self.init_pending or delta == 0) {
@@ -841,6 +841,15 @@ pub const KVManager = struct {
         };
         defer stream_info.deinit();
 
+        return try KV.init(self.js, bucket_name);
+    }
+
+    /// Open a KV bucket WITHOUT asking the server about its stream — nats.js's
+    /// `Kvm.open` (bindOnly). A missing bucket is found at the first read instead.
+    /// What a key-scoped credential needs: `STREAM.INFO` takes a `subjects_filter` in
+    /// its body that no subject grant can scope, so granting it for `openBucket` lets
+    /// the holder list every key of the bucket (ZeBridge NOTES §10jr).
+    pub fn bindBucket(self: KVManager, bucket_name: []const u8) !KV {
         return try KV.init(self.js, bucket_name);
     }
 

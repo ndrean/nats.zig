@@ -26,9 +26,18 @@ pub const output_buffer_len: usize = 0;
 pub const Cipher = struct {};
 
 pub const config = struct {
+    pub const CipherSuite = enum(u16) { _ };
+
+    pub const cipher_suites = struct {
+        pub const all: []const CipherSuite = &.{};
+        pub const secure: []const CipherSuite = &.{};
+        pub const tls13: []const CipherSuite = &.{};
+    };
+
     pub const Client = struct {
         host: []const u8 = "",
         root_ca: std.crypto.Certificate.Bundle = .empty,
+        cipher_suites: []const CipherSuite = &.{},
         insecure_skip_verify: bool = false,
         auth: ?*CertKeyPair = null,
         rng: std.Random = undefined,
