@@ -9,11 +9,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const zio = b.dependency("zio", .{
-        .target = target,
-        .optimize = optimize,
-    });
-
     const benchmarks = [_][]const u8{
         "echo_server",
         "echo_client",
@@ -31,7 +26,6 @@ pub fn build(b: *std.Build) void {
             }),
         });
         exe.root_module.addImport("nats", nats.module("nats"));
-        exe.root_module.addImport("zio", zio.module("zio"));
         b.installArtifact(exe);
     }
 

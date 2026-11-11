@@ -1,6 +1,5 @@
 const std = @import("std");
 const nats = @import("nats");
-const zio = @import("zio");
 const bench_util = @import("bench_util.zig");
 
 const REPORT_INTERVAL = 1000;

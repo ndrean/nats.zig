@@ -1358,3 +1358,13 @@ green over 37.
 **Change** (`src/jetstream_message.zig`, `src/jetstream.zig`): a `lifetime` state on `JetStreamMessage` (`owned`, `in_handler`, `free_requested`). The push wrapper sets `in_handler` before the handler and calls `endHandler` (deferred) after the auto-ack. While in the handler, `deinit` only records the request; `endHandler` then frees the message, or, if the handler kept it, hands it back so that its later `deinit`, from any thread, frees it at once. Compare-and-swap on both sides, so a `deinit` from another thread during the ack is safe. Pull-subscription messages never leave `owned`: their `deinit` is unchanged.
 
 **Verified:** `test-e2e` 194/194 twice (nats-server 2.15.2), `test-unit` 145/145 with a new test (a message freed in the handler stays readable until `endHandler`, then is freed once; a kept one is freed by the owner's `deinit`; the testing allocator checks leaks and double frees). Mutation: without the two wrapper lines, `test-e2e` crashes again at the same address. An upstream candidate.
+
+## 46. Patch 45: the benchmarks run on std.Io.Threaded, without zio (2026-11-11)
+
+**How it appeared.** With CI on Zig 0.17.1 (patch 43), the "Build benchmarks" step failed: the benchmarks' only dependency besides nats.zig, `lalinsky/zio` at `175ca48` (package `zio-0.17.0-…`), writes `[_]u8{0} ** n`, which Zig 0.17.0 and 0.17.1 both refuse (`@splat` replaces it). The benchmarks had not built on any 0.17 release: CI was still on 0.16.0. zio upstream moved to 0.17 later (#792), but nothing here needs it: the library and its users run on `std.Io.Threaded`, and zio only supplied the benchmarks' `Io`.
+
+**Change** (`benchmarks/`): `bench_util.connect` creates a heap-allocated `std.Io.Threaded` (stable address for the `Io` it hands the connection) and `deinit` frees it; the zio dependency, its import in `echo_client.zig` and its module in `build.zig` are gone; `minimum_zig_version` 0.17.0.
+
+**Verified:** `zig build -Dc_benchmarks=false` (the CI step) on 0.17.1 and 0.17.0, fresh caches, all four executables. A 3 s run against a local nats-server 2.15.2: the publisher sent 1.69 M messages (626 k/s), the subscriber received them (about 290 k/s), both exit 0 on SIGINT with no leak report from their `DebugAllocator`.
+
+**Seen, not investigated:** after SIGINT the subscriber logs `Failed to send UNSUB for unknown sid 1: error.Closed` (three times) from `sub.deinit()`: the connection had already dropped the subscription and closed. The swap supplies only the `Io`, so this is the library's shutdown under a signal on `std.Io.Threaded`, not zio's absence; CI builds the benchmarks without running them.
